@@ -129,14 +129,8 @@ impl ExpoDefaults {
             .or_else(|| expo["name"].as_str())
             .map(|s| s.to_string());
 
-        // Infer workspace path if ios/ dir exists
-        if let Some(bundle_id) = &defaults.ios_bundle_id {
-            let app_name = bundle_id.split('.').last().unwrap_or("App");
-            let ws = format!("ios/{}.xcworkspace", capitalize(app_name));
-            if PathBuf::from(&ws).exists() {
-                defaults.ios_workspace = Some(ws);
-            }
-        }
+        // Scan ios/ directory for .xcworkspace
+        defaults.ios_workspace = find_xcworkspace();
 
         // Android
         defaults.android_package = expo["android"]["package"]
@@ -145,21 +139,14 @@ impl ExpoDefaults {
 
         // EAS config (eas.json)
         if let Some(eas) = read_eas_json() {
-            // ASC App ID
-            defaults.asc_app_id = eas["submit"]["production"]["ios"]["ascAppId"]
-                .as_str()
-                .map(|s| s.to_string());
+            // ASC App ID — check common profile names
+            defaults.asc_app_id = find_eas_ios_field(&eas, "ascAppId");
 
             // Apple Team ID
-            defaults.apple_team_id = eas["submit"]["production"]["ios"]["appleTeamId"]
-                .as_str()
-                .map(|s| s.to_string());
+            defaults.apple_team_id = find_eas_ios_field(&eas, "appleTeamId");
 
             // Google service account
-            defaults.google_service_account = eas["submit"]["production"]["android"]
-                ["serviceAccountKeyPath"]
-                .as_str()
-                .map(|s| s.to_string());
+            defaults.google_service_account = find_eas_android_field(&eas, "serviceAccountKeyPath");
         }
 
         Some(defaults)
@@ -169,6 +156,43 @@ impl ExpoDefaults {
 fn read_eas_json() -> Option<serde_json::Value> {
     let content = std::fs::read_to_string("eas.json").ok()?;
     serde_json::from_str(&content).ok()
+}
+
+/// Search all submit profiles (production, preview, development, ...) for a field
+fn find_eas_ios_field(eas: &serde_json::Value, field: &str) -> Option<String> {
+    let profiles = eas["submit"].as_object()?;
+    for (_, profile) in profiles {
+        if let Some(val) = profile["ios"][field].as_str() {
+            return Some(val.to_string());
+        }
+    }
+    None
+}
+
+fn find_eas_android_field(eas: &serde_json::Value, field: &str) -> Option<String> {
+    let profiles = eas["submit"].as_object()?;
+    for (_, profile) in profiles {
+        if let Some(val) = profile["android"][field].as_str() {
+            return Some(val.to_string());
+        }
+    }
+    None
+}
+
+/// Scan ios/ directory for the first .xcworkspace
+fn find_xcworkspace() -> Option<String> {
+    let ios_dir = PathBuf::from("ios");
+    if !ios_dir.exists() {
+        return None;
+    }
+    let entries = std::fs::read_dir(&ios_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("xcworkspace") {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+    None
 }
 
 fn capitalize(s: &str) -> String {
