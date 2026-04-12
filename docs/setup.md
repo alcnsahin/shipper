@@ -6,6 +6,18 @@ This document explains every value asked during `shipper init` and how to obtain
 
 ## `shipper init` — Field Reference
 
+### Platform
+
+The first question after the project name. Controls which sections are generated in `shipper.toml` and which credentials are written to `~/.shipper/config.toml`.
+
+| Input | Effect |
+|-------|--------|
+| `ios` | Only iOS questions are asked. `[ios]` + `[credentials.apple]` generated. |
+| `android` | Only Android questions are asked. `[android]` + `[credentials.google]` generated. |
+| `all` or Enter | Both platforms configured. |
+
+---
+
 ### Project name
 
 Any display name for your project. Used in notification messages.
@@ -44,12 +56,31 @@ The unique identifier for your iOS app (reverse-domain format).
 
 The numeric ID of your app in App Store Connect. This is **not** the Bundle ID.
 
+**This field is optional.** Leave it empty if your app doesn't exist on App Store Connect yet.
+
+**If the app already exists:**
+
 1. Go to [App Store Connect](https://appstoreconnect.apple.com) → **Apps**
 2. Select your app
 3. The numeric ID is visible in the URL: `appstoreconnect.apple.com/apps/`**`6762051322`**`/...`
 4. Also found under **App Information → Apple ID**
 
 - Expo + EAS: auto-filled from `eas.json → submit.production.ios.ascAppId`
+
+**If the app doesn't exist yet (first-time submission):**
+
+1. Leave this field empty during `shipper init`
+2. Run `shipper deploy ios` — the IPA will be uploaded but build status polling will be skipped
+3. Create the app in App Store Connect: **Apps → +**
+   - Use the same Bundle ID configured in `shipper.toml`
+4. Copy the numeric App ID from the URL and add it to `shipper.toml`:
+
+```toml
+[ios]
+asc_app_id = "6762051322"
+```
+
+From the next deploy onwards, shipper will poll App Store Connect and wait for the build to finish processing.
 
 ---
 

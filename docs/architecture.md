@@ -119,7 +119,7 @@ shipper deploy ios
 ├─ 7. Upload
 │      xcrun altool --upload-app --apiKey ... --apiIssuer ...
 │
-├─ 8. Poll App Store Connect
+├─ 8. Poll App Store Connect  [skipped if asc_app_id not set]
 │      GET /v1/builds?filter[app]=...
 │      Polls every 30s until processingState == VALID (max 20 min)
 │

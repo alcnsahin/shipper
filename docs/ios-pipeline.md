@@ -143,7 +143,10 @@ xcrun iTMSTransporter -m upload \
     -apiIssuer your-issuer-id
 ```
 
-### Step 6: Poll Processing Status
+### Step 6: Poll Processing Status (requires `asc_app_id`)
+
+> **Skipped on first submission** if `asc_app_id` is not set in `shipper.toml`.
+> See the [Setup Guide](setup.md#app-store-connect-app-id) for how to obtain it after first upload.
 
 ```
 GET https://api.appstoreconnect.apple.com/v1/builds
