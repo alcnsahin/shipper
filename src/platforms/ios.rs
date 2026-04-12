@@ -53,8 +53,18 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
         progress::step(3, total, "CocoaPods — skipped (no Podfile)");
     }
 
-    // Resolve actual scheme name from workspace (Expo prebuild may use different casing)
-    let resolved_scheme = resolve_scheme_from_workspace(ios).unwrap_or_else(|| ios.scheme.clone());
+    // After prebuild, resolve the real workspace path and scheme name from the filesystem.
+    // shipper.toml may have wrong casing (e.g. "cyberchan" instead of "CyberChan").
+    let (resolved_workspace, resolved_scheme) = resolve_build_config(ios);
+
+    if resolved_workspace.as_deref() != ios.workspace.as_deref() {
+        println!(
+            "  {} Workspace auto-corrected: {} → {}",
+            style("i").dim(),
+            ios.workspace.as_deref().unwrap_or("(none)"),
+            resolved_workspace.as_deref().unwrap_or("(none)")
+        );
+    }
     if resolved_scheme != ios.scheme {
         println!(
             "  {} Scheme auto-corrected: {} → {}",
@@ -66,7 +76,7 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
 
     // Step 4: Archive
     progress::step(4, total, "Archiving with xcodebuild");
-    let archive_path = archive(ios, &resolved_scheme, &app_version).await?;
+    let archive_path = archive(ios, resolved_workspace.as_deref(), &resolved_scheme, &app_version).await?;
     progress::success(&format!("Archive created: {}", archive_path.display()));
 
     // Step 5: Export IPA
@@ -252,12 +262,34 @@ async fn pod_install(ios_dir: &Path) -> Result<()> {
 
 // ─── xcodebuild archive ───────────────────────────────────────────────────────
 
-fn resolve_scheme_from_workspace(ios: &IosConfig) -> Option<String> {
-    let workspace = ios.workspace.as_ref()?;
-    let schemes_dir = PathBuf::from(workspace).join("xcshareddata/xcschemes");
-    let entries = std::fs::read_dir(&schemes_dir).ok()?;
+/// Scan the actual ios/ directory for the workspace and scheme after prebuild.
+/// Returns (resolved_workspace, resolved_scheme) — corrects casing issues in shipper.toml.
+fn resolve_build_config(ios: &IosConfig) -> (Option<String>, String) {
+    // Find real workspace by scanning ios/ (handles case mismatches on macOS)
+    let actual_workspace = scan_for_xcworkspace().or_else(|| ios.workspace.clone());
 
-    let mut schemes: Vec<String> = entries
+    let scheme = match &actual_workspace {
+        Some(ws) => find_scheme_in_workspace(ws, &ios.scheme).unwrap_or_else(|| ios.scheme.clone()),
+        None => ios.scheme.clone(),
+    };
+
+    (actual_workspace, scheme)
+}
+
+fn scan_for_xcworkspace() -> Option<String> {
+    for entry in std::fs::read_dir("ios").ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("xcworkspace") {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+fn find_scheme_in_workspace(workspace: &str, configured_scheme: &str) -> Option<String> {
+    let schemes_dir = PathBuf::from(workspace).join("xcshareddata/xcschemes");
+    let schemes: Vec<String> = std::fs::read_dir(&schemes_dir)
+        .ok()?
         .flatten()
         .filter_map(|e| {
             let p = e.path();
@@ -269,26 +301,23 @@ fn resolve_scheme_from_workspace(ios: &IosConfig) -> Option<String> {
         })
         .collect();
 
-    // Exact match — config is already correct
-    if schemes.iter().any(|s| s == &ios.scheme) {
+    // Exact match — already correct, no change needed
+    if schemes.iter().any(|s| s == configured_scheme) {
         return None;
     }
-
-    // Case-insensitive match — return the correctly-cased name
-    let lower = ios.scheme.to_lowercase();
-    if let Some(matched) = schemes.iter().find(|s| s.to_lowercase() == lower) {
-        return Some(matched.clone());
+    // Case-insensitive match
+    let lower = configured_scheme.to_lowercase();
+    if let Some(m) = schemes.iter().find(|s| s.to_lowercase() == lower) {
+        return Some(m.clone());
     }
-
-    // If only one scheme exists, use it
+    // Single scheme fallback
     if schemes.len() == 1 {
-        return Some(schemes.remove(0));
+        return Some(schemes[0].clone());
     }
-
     None
 }
 
-async fn archive(ios: &IosConfig, scheme: &str, version: &AppVersion) -> Result<PathBuf> {
+async fn archive(ios: &IosConfig, workspace: Option<&str>, scheme: &str, version: &AppVersion) -> Result<PathBuf> {
     let archive_path = PathBuf::from(&ios.build_dir)
         .join(format!("{}.xcarchive", scheme));
 
@@ -308,8 +337,8 @@ async fn archive(ios: &IosConfig, scheme: &str, version: &AppVersion) -> Result<
         "CODE_SIGN_STYLE=Manual".to_string(),
     ];
 
-    if let Some(ws) = &ios.workspace {
-        args.insert(1, ws.clone());
+    if let Some(ws) = workspace {
+        args.insert(1, ws.to_string());
         args.insert(1, "-workspace".to_string());
     } else if let Some(proj) = &ios.project {
         args.insert(1, proj.clone());
