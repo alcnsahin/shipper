@@ -5,24 +5,39 @@ This document covers how to set up iOS distribution credentials so that
 
 ---
 
-## Prerequisites
+## How shipper handles signing
 
-- macOS with Xcode installed
-- Apple Developer account with an active membership
-- EAS CLI installed (`npm install -g eas-cli`) — optional but easiest path
+Before every `shipper deploy ios` run, shipper automatically:
+
+1. **Checks** whether a valid distribution certificate exists in your Keychain
+2. **Checks** whether a matching provisioning profile is installed on disk
+3. **If either is missing**, searches for credential files in:
+   - `~/.shipper/keys/<bundle_id>/` (preferred persistent location)
+   - `./credentials/ios/` (EAS CLI download location)
+4. **Installs** whatever it finds — certificate into Keychain, profile into the Xcode profiles directory
+5. **Copies** any files found in `./credentials/ios/` to `~/.shipper/keys/<bundle_id>/` so they work for future runs
+
+No separate setup command is needed. Just place the files in the right location and run `shipper deploy ios`.
+
+Once detected, shipper prints what it found:
+```
+  ✓ Distribution certificate installed
+  ✓ Provisioning profile installed
+  i Provisioning profile: CyberChan AppStore
+  i Code sign identity:   iPhone Distribution: STELIKON OU (QC686RQ858)
+```
 
 ---
 
 ## What is needed
 
-To archive and upload an iOS app, two things must be present on your Mac:
+To archive and upload an iOS app, two credential files must be available:
 
-| Credential | Where it lives | What it is |
-|---|---|---|
-| **Distribution Certificate** | macOS Keychain | Proves you are an authorized Apple developer |
-| **Provisioning Profile** | `~/Library/MobileDevice/Provisioning Profiles/` | Authorizes your app (bundle ID) for App Store distribution |
-
-Both must be installed locally. EAS cloud credentials are not enough — `xcodebuild` reads from Keychain and the local profiles directory.
+| File | What it is |
+|---|---|
+| `dist-cert.p12` | Distribution certificate + private key |
+| `profile.mobileprovision` | Provisioning profile for your bundle ID |
+| `credentials.json` | Contains the p12 password (`certPassword` field) |
 
 ---
 
@@ -41,50 +56,45 @@ eas credentials --platform ios
 3. Choose: **credentials.json: Upload/Download credentials between EAS servers and your local json**
 4. Choose: **Download credentials from EAS to credentials.json**
 
-This creates two files in your project:
+This creates files in your project:
 ```
 credentials/
   ios/
-    dist-cert.p12       ← Distribution certificate + private key
+    dist-cert.p12
     profile.mobileprovision
-    credentials.json    ← Contains the p12 password
+    credentials.json        ← contains the p12 password under "certPassword"
 ```
 
-> **Important:** Add `credentials/` to `.gitignore`. It contains private keys.
+### Step 2 — Move credentials to shipper's key directory
 
-### Step 2 — Install the distribution certificate
+Shipper reads credentials from `~/.shipper/keys/<bundle_id>/`. Move the files there
+so they persist across projects and are never accidentally committed:
 
 ```bash
-# Get the p12 password
-cat credentials/ios/credentials.json | grep -i password
+BUNDLE_ID="com.company.myapp"   # your actual bundle ID
 
-# Open the p12 (Keychain Access will prompt for the password)
-open credentials/ios/dist-cert.p12
+mkdir -p ~/.shipper/keys/$BUNDLE_ID
+mv credentials/ios/dist-cert.p12          ~/.shipper/keys/$BUNDLE_ID/
+mv credentials/ios/profile.mobileprovision ~/.shipper/keys/$BUNDLE_ID/
+mv credentials/ios/credentials.json        ~/.shipper/keys/$BUNDLE_ID/
+chmod 600 ~/.shipper/keys/$BUNDLE_ID/*
+
+# Remove the now-empty directory from your project
+rmdir credentials/ios credentials 2>/dev/null || true
 ```
 
-When Keychain Access opens, enter the password from `credentials.json` and click **Add**.
+> **Important:** Do not keep `credentials/` in your project directory — it contains private keys.
+> Add `credentials/` to `.gitignore` as a safety net.
 
-Verify it was installed:
-```bash
-security find-identity -v -p codesigning
-# Should show: "iPhone Distribution: Your Company (TEAMID)"
-```
-
-### Step 3 — Install the provisioning profile
-
-```bash
-open credentials/ios/profile.mobileprovision
-```
-
-Xcode registers the profile automatically.
-
-### Step 4 — Deploy
+### Step 3 — Deploy
 
 ```bash
 shipper deploy ios
 ```
 
-Shipper will automatically detect the certificate and provisioning profile — no manual configuration needed.
+Shipper detects that the certificate and profile are not yet installed, finds the files in
+`~/.shipper/keys/<bundle_id>/`, reads the password from `credentials.json`, and installs
+everything automatically before proceeding with the build.
 
 ---
 
@@ -99,50 +109,75 @@ Use this if you don't have EAS or prefer full manual control.
 3. Follow the CSR steps (Keychain Access → Certificate Assistant → Request a Certificate)
 4. Download the `.cer` file and double-click to install in Keychain
 
+Export as `.p12` for use across machines:
+
+```
+Keychain Access → My Certificates → right-click "Apple Distribution: ..." → Export
+```
+
+Save the exported file as `~/.shipper/keys/<bundle_id>/dist-cert.p12` and record the
+export password in `~/.shipper/keys/<bundle_id>/credentials.json`:
+
+```json
+{ "certPassword": "your-export-password" }
+```
+
 ### Provisioning Profile
 
 1. Go to [developer.apple.com](https://developer.apple.com) → Profiles
 2. Click **+** → **App Store Connect**
 3. Select your App ID (bundle ID)
-4. Select the Distribution certificate you just created
-5. Download the `.mobileprovision` file and double-click to install
+4. Select the Distribution certificate
+5. Download the `.mobileprovision` file
 
-### shipper.toml configuration
+Save it as `~/.shipper/keys/<bundle_id>/profile.mobileprovision`.
 
-After manual setup, you can explicitly set the values in `shipper.toml` to skip auto-detection:
+### Step 3 — Deploy
+
+```bash
+shipper deploy ios
+```
+
+Same as above — shipper installs everything automatically.
+
+---
+
+## Skip auto-detection (optional)
+
+If you want to skip the auto-detection step on every run, add explicit values to `shipper.toml`:
 
 ```toml
 [ios]
 provisioning_profile = "CyberChan AppStore"
-code_sign_identity = "iPhone Distribution: STELIKON OU (QC686RQ858)"
+code_sign_identity   = "iPhone Distribution: STELIKON OU (QC686RQ858)"
+```
+
+Shipper will use these directly without scanning the filesystem.
+
+---
+
+## Credential file layout
+
+```
+~/.shipper/
+└── keys/
+    └── <bundle_id>/
+        ├── dist-cert.p12          ← Distribution certificate + private key
+        ├── profile.mobileprovision
+        └── credentials.json       ← { "certPassword": "..." }
 ```
 
 ---
 
-## How shipper handles signing
+## Provisioning profile install location
 
-On every `shipper deploy ios` run, if `provisioning_profile` or
-`code_sign_identity` are not set in `shipper.toml`, shipper will:
+Shipper installs profiles to the Xcode 15+ location:
 
-1. **Scan** `~/Library/MobileDevice/Provisioning Profiles/` for a distribution
-   profile matching your bundle ID
-2. **Check** the Keychain via `security find-identity -v -p codesigning` for
-   an `Apple Distribution` or `iPhone Distribution` identity
-3. **Prompt** you interactively if nothing is found
-
-Once detected, shipper prints what it found:
 ```
-  i Provisioning profile detected: CyberChan AppStore
-  i Code sign identity detected: iPhone Distribution: STELIKON OU (QC686RQ858)
+~/Library/Developer/Xcode/UserData/Provisioning Profiles/<UUID>.mobileprovision
 ```
 
-To avoid the detection step on every run, add these to `shipper.toml`:
-
-```toml
-[ios]
-provisioning_profile = "CyberChan AppStore"
-code_sign_identity = "iPhone Distribution: STELIKON OU (QC686RQ858)"
-```
+The UUID is read from the profile's embedded plist.
 
 ---
 
@@ -150,20 +185,22 @@ code_sign_identity = "iPhone Distribution: STELIKON OU (QC686RQ858)"
 
 | Error | Cause | Fix |
 |---|---|---|
-| `requires a provisioning profile` | No profile set and none detected | Follow setup steps above |
-| `0 valid identities found` | Distribution cert not in Keychain | Install the `.p12` file |
+| `requires a provisioning profile` | No profile found in either search location | Place `profile.mobileprovision` in `~/.shipper/keys/<bundle_id>/` |
+| `0 valid identities found` | Distribution cert not in Keychain and no `.p12` found | Place `dist-cert.p12` + `credentials.json` in `~/.shipper/keys/<bundle_id>/` |
+| `Failed to import certificate` | Wrong p12 password | Check `certPassword` in `credentials.json` |
 | `xcodebuild archive failed` | Profile / cert mismatch | Ensure profile uses the same cert that is in Keychain |
-| `Certificate has been revoked` | Old cert revoked on Apple portal | Generate a new cert via `eas credentials` or Developer Portal |
+| `Certificate has been revoked` | Old cert revoked on Apple portal | Re-download via `eas credentials` or Developer Portal |
 
 ---
 
 ## Security notes
 
-- `credentials/ios/dist-cert.p12` contains your private key — treat it like a password
-- Add `credentials/` to `.gitignore` immediately after downloading
-- `chmod 600` the files if storing long-term:
+- `dist-cert.p12` contains your private key — treat it like a password
+- Never commit `credentials/` or `~/.shipper/keys/` to version control
+- Set strict permissions on all credential files:
 
 ```bash
-chmod 600 credentials/ios/dist-cert.p12
-chmod 600 credentials/ios/credentials.json
+chmod 600 ~/.shipper/keys/<bundle_id>/dist-cert.p12
+chmod 600 ~/.shipper/keys/<bundle_id>/credentials.json
+chmod 600 ~/.shipper/keys/<bundle_id>/profile.mobileprovision
 ```

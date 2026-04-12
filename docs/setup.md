@@ -41,7 +41,8 @@ Path to your Xcode workspace file, relative to the project root.
 
 The Xcode build scheme to archive.
 
-- Expo: auto-filled from `app.json → expo.scheme` (or `slug`, or `name`)
+- Expo: auto-filled from `app.json → expo.name` (the display name, e.g. `"CyberChan"`)
+  > **Note:** `expo.scheme` is the deep-link URI scheme (e.g. `"cyberchan"`), not the Xcode build scheme. Shipper uses `expo.name` for scheme detection.
 - Native: open Xcode → **Product → Scheme → Manage Schemes** — use the scheme marked as "Shared"
 
 #### Bundle ID

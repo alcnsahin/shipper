@@ -215,6 +215,7 @@ chmod 600 ~/.shipper/keys/release.keystore
 ```
 shipper deploy ios
 │
+├─ 0. Auto-install signing    check Keychain + profiles, install from ~/.shipper/keys/<bundle_id>/
 ├─ 1. Bump build number       app.json or Info.plist
 ├─ 2. expo prebuild           (Expo / React Native projects only)
 ├─ 3. pod install             (if Podfile exists)

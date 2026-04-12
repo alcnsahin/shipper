@@ -8,11 +8,11 @@ The iOS pipeline handles the complete flow from source code to TestFlight/App St
 
 - **macOS** with Xcode installed (`xcode-select --install`)
 - **Apple Developer Account** with App Store Connect API key (.p8)
-- **Provisioning Profile** + Distribution Certificate installed
+- **Distribution certificate + provisioning profile** — installed automatically by shipper (see [iOS Code Signing Setup](ios-code-signing.md))
 
 ## Apple Credentials Setup
 
-### 1. App Store Connect API Key
+### App Store Connect API Key
 
 Generate at: https://appstoreconnect.apple.com/access/integrations/api
 
@@ -24,7 +24,7 @@ Key File:   AuthKey_W54D6Z8Y5M.p8 (downloaded once, save securely)
 
 Store at `~/.shipper/keys/AuthKey_W54D6Z8Y5M.p8`
 
-### 2. JWT Token Generation
+### JWT Token Generation
 
 App Store Connect API uses short-lived JWTs:
 
@@ -47,23 +47,34 @@ Payload:
 Signed with: AuthKey_W54D6Z8Y5M.p8 (ES256/P-256)
 ```
 
-### 3. Provisioning Profile
-
-Option A: Download from Apple Developer Portal manually
-Option B: Use App Store Connect API to manage programmatically
+Before calling `xcrun altool`, shipper copies the `.p8` key to
+`~/.appstoreconnect/private_keys/` — the only path altool recognises.
 
 ## Build Steps
+
+### Step 0: Auto-install Signing Credentials
+
+Before the build starts, shipper verifies that a distribution certificate exists in
+Keychain and a matching provisioning profile is installed. If either is missing, it
+searches `~/.shipper/keys/<bundle_id>/` (then `./credentials/ios/`) and installs
+automatically.
+
+See [iOS Code Signing Setup](ios-code-signing.md) for the full credential layout.
 
 ### Step 1: Expo Prebuild (React Native/Expo only)
 
 ```bash
-# Detect if expo project
 if [ -f "app.json" ] && grep -q "expo" app.json; then
     npx expo prebuild --platform ios --clean
 fi
 ```
 
 This generates the `ios/` directory with native Xcode project.
+
+- Workspace name is derived from `expo.name` in `app.json` (e.g. `ios/MyApp.xcworkspace`)
+- Xcode scheme name also comes from `expo.name` — not `expo.scheme` (which is the deep-link URI scheme, not the Xcode build scheme)
+
+After prebuild, shipper rescans `ios/` to confirm the actual workspace and scheme names.
 
 ### Step 2: Install CocoaPods
 
@@ -75,73 +86,69 @@ cd ios && pod install --repo-update && cd ..
 
 ```bash
 xcodebuild archive \
-    -workspace ios/CyberChan.xcworkspace \
-    -scheme CyberChan \
+    -workspace ios/MyApp.xcworkspace \
+    -scheme MyApp \
     -configuration Release \
-    -archivePath build/CyberChan.xcarchive \
+    -archivePath build/shipper/MyApp.xcarchive \
     -destination "generic/platform=iOS" \
     CODE_SIGN_STYLE=Manual \
-    PROVISIONING_PROFILE_SPECIFIER="your-profile-name" \
-    CODE_SIGN_IDENTITY="Apple Distribution: STELIKON OU (QC686RQ858)"
+    DEVELOPMENT_TEAM=QC686RQ858 \
+    PROVISIONING_PROFILE_SPECIFIER="MyApp AppStore" \
+    CODE_SIGN_IDENTITY="iPhone Distribution: Company (TEAMID)"
 ```
+
+`DEVELOPMENT_TEAM` is always passed — required for manual signing with Xcode 15+.
 
 ### Step 4: Export IPA
 
-Create `ExportOptions.plist`:
+Shipper generates `ExportOptions.plist` from `shipper.toml`:
+
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "...">
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>method</key>
-    <string>app-store</string>
+    <string>app-store-connect</string>       <!-- Xcode 16+: was "app-store" -->
     <key>teamID</key>
     <string>QC686RQ858</string>
+    <key>signingStyle</key>
+    <string>manual</string>
     <key>signingCertificate</key>
     <string>Apple Distribution</string>
     <key>provisioningProfiles</key>
     <dict>
-        <key>app.cyberchan.mobile</key>
-        <string>CyberChan AppStore</string>
+        <key>com.company.myapp</key>
+        <string>MyApp AppStore</string>
     </dict>
     <key>destination</key>
-    <string>upload</string>
+    <string>export</string>                  <!-- "upload" would trigger ASC upload during export -->
 </dict>
 </plist>
 ```
 
 ```bash
 xcodebuild -exportArchive \
-    -archivePath build/CyberChan.xcarchive \
-    -exportPath build/ipa \
-    -exportOptionsPlist ExportOptions.plist
+    -archivePath build/shipper/MyApp.xcarchive \
+    -exportPath build/shipper/ipa \
+    -exportOptionsPlist /tmp/ExportOptions.plist
 ```
+
+> **Note:** `destination: export` (not `upload`) is required to produce a local `.ipa` file.
+> Using `upload` causes xcodebuild to attempt an App Store Connect connection during export,
+> which produces confusing errors before the actual upload step.
 
 ### Step 5: Upload to App Store Connect
 
-**Option A: xcrun altool (legacy, simpler)**
 ```bash
 xcrun altool --upload-app \
     --type ios \
-    --file build/ipa/CyberChan.ipa \
+    --file build/shipper/ipa/MyApp.ipa \
     --apiKey W54D6Z8Y5M \
     --apiIssuer your-issuer-id
 ```
 
-**Option B: App Store Connect API (modern, more control)**
-```
-POST https://is1-ssl.mzstatic.com/itms/api/v1
-# Transporter protocol — chunked upload
-```
-
-**Option C: xcrun notarytool + iTMSTransporter**
-```bash
-# Apple's official upload tool
-xcrun iTMSTransporter -m upload \
-    -assetFile build/ipa/CyberChan.ipa \
-    -apiKey ~/.shipper/keys/AuthKey_W54D6Z8Y5M.p8 \
-    -apiIssuer your-issuer-id
-```
+The `.p8` key must be in `~/.appstoreconnect/private_keys/` — shipper copies it there automatically if needed.
 
 ### Step 6: Poll Processing Status (requires `asc_app_id`)
 
@@ -151,9 +158,9 @@ xcrun iTMSTransporter -m upload \
 ```
 GET https://api.appstoreconnect.apple.com/v1/builds
     ?filter[app]=6762051322
-    &filter[version]=1.0.1
+    &filter[version]=42          ← build number (CFBundleVersion), NOT marketing version
     &sort=-uploadedDate
-    &limit=1
+    &limit=5
 
 Headers:
     Authorization: Bearer <jwt>
@@ -163,40 +170,34 @@ Response:
   "data": [{
     "attributes": {
       "processingState": "PROCESSING" | "VALID" | "INVALID",
-      "version": "1.0.1",
-      "buildNumber": "42"
+      "version": "42",
+      "uploadedDate": "2025-01-01T00:00:00Z"
     }
   }]
 }
 ```
 
-Poll every 30 seconds until `processingState == "VALID"`.
+Polls every 30 seconds until `processingState == "VALID"` (max 20 minutes).
 
-### Step 7: Auto-submit to TestFlight (optional)
+> **Important:** `filter[version]` is the **build number** (e.g. `42`), not the marketing
+> version (e.g. `1.0.0`). These are separate fields in Xcode / App Store Connect.
+
+### Step 7: Notify
 
 ```
-# Create beta group submission
-POST https://api.appstoreconnect.apple.com/v1/betaAppReviewSubmissions
-{
-  "data": {
-    "type": "betaAppReviewSubmissions",
-    "relationships": {
-      "build": {
-        "data": { "type": "builds", "id": "<build-id>" }
-      }
-    }
-  }
-}
+Telegram / Slack → "MyApp v1.0.1 (42) → TestFlight ✅"
 ```
 
 ## Error Recovery
 
 | Error | Recovery |
 |-------|----------|
-| `xcodebuild` timeout | Retry with `-retry-tests-on-failure` |
-| Code signing failed | Check `security find-identity -v -p codesigning` |
-| Upload 401 | Regenerate JWT (expired after 20min) |
-| Processing INVALID | Check App Store Connect for error details |
+| `requires a provisioning profile` | Place credential files in `~/.shipper/keys/<bundle_id>/` |
+| `0 valid identities found` | Place `dist-cert.p12` + `credentials.json` in `~/.shipper/keys/<bundle_id>/` |
+| `requires a development team` | Set `team_id` in `~/.shipper/config.toml → [credentials.apple]` |
+| `App Store Connect Credentials Error` | Check that `destination: export` is used in ExportOptions |
+| Upload 401 | JWT expired — regenerated automatically on next retry |
+| Processing INVALID | Check App Store Connect for detailed error messages |
 | Network timeout | Retry with exponential backoff |
 
 ## Config Reference
@@ -204,13 +205,13 @@ POST https://api.appstoreconnect.apple.com/v1/betaAppReviewSubmissions
 ```toml
 # shipper.toml
 [ios]
-workspace = "ios/MyApp.xcworkspace"   # or: project = "ios/MyApp.xcodeproj"
-scheme = "MyApp"
-bundle_id = "com.company.app"
-asc_app_id = "1234567890"             # numeric ID from App Store Connect
-export_method = "app-store"           # app-store | ad-hoc | development
-provisioning_profile = "MyApp AppStore"   # optional, manual signing
-code_sign_identity = "Apple Distribution: Company (TEAMID)"  # optional
-configuration = "Release"
-build_dir = "build/shipper"           # default
+workspace            = "ios/MyApp.xcworkspace"   # or: project = "ios/MyApp.xcodeproj"
+scheme               = "MyApp"
+bundle_id            = "com.company.app"
+asc_app_id           = "1234567890"              # numeric ID from App Store Connect
+export_method        = "app-store-connect"       # app-store-connect | ad-hoc | development
+provisioning_profile = "MyApp AppStore"          # optional — auto-detected if omitted
+code_sign_identity   = "Apple Distribution: Company (TEAMID)"  # optional — auto-detected
+configuration        = "Release"
+build_dir            = "build/shipper"           # default
 ```

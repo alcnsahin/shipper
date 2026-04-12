@@ -20,11 +20,12 @@
 │   │      │   iOS Pipeline  │        │  Android Pipeline  │   │  │
 │   │      │ platforms/ios.rs│        │platforms/android.rs│   │  │
 │   │      │                 │        │                    │   │  │
-│   │      │ 1. version bump │        │ 1. version bump    │   │  │
-│   │      │ 2. expo prebuild│        │ 2. expo prebuild   │   │  │
-│   │      │ 3. pod install  │        │ 3. gradle build    │   │  │
-│   │      │ 4. xcodebuild   │        │ 4. apksigner       │   │  │
-│   │      │ 5. export IPA   │        │ 5. play store API  │   │  │
+│   │      │ 0. signing setup│        │ 1. version bump    │   │  │
+│   │      │ 1. version bump │        │ 2. expo prebuild   │   │  │
+│   │      │ 2. expo prebuild│        │ 3. gradle build    │   │  │
+│   │      │ 3. pod install  │        │ 4. apksigner       │   │  │
+│   │      │ 4. xcodebuild   │        │ 5. play store API  │   │  │
+│   │      │ 5. export IPA   │        │                    │   │  │
 │   │      │ 6. altool upload│        │                    │   │  │
 │   │      │ 7. asc poll     │        │                    │   │  │
 │   │      └────────┬────────┘        └─────────┬──────────┘   │  │
@@ -85,6 +86,8 @@ shipper/
 └── docs/
     ├── architecture.md
     ├── ios-pipeline.md
+    ├── ios-code-signing.md
+    ├── setup.md
     └── release.md
 ```
 
@@ -95,6 +98,10 @@ shipper/
 ```
 shipper deploy ios
 │
+├─ 0. Auto-install signing credentials
+│      Check Keychain for dist cert, check disk for provisioning profile
+│      If missing: search ~/.shipper/keys/<bundle_id>/ → install automatically
+│
 ├─ 1. Preflight checks
 │      xcodebuild, xcrun — exits early if missing
 │
@@ -104,23 +111,26 @@ shipper deploy ios
 │
 ├─ 3. Expo prebuild  (if app.json contains "expo")
 │      npx expo prebuild --platform ios --clean
+│      Workspace/scheme names derived from expo.name (not expo.scheme)
 │
 ├─ 4. CocoaPods  (if Podfile exists)
 │      pod install --repo-update
 │
 ├─ 5. xcodebuild archive
-│      xcodebuild archive -workspace ... -scheme ... -archivePath ...
+│      xcodebuild archive -workspace ... -scheme ...
+│      DEVELOPMENT_TEAM=<team_id> CODE_SIGN_STYLE=Manual
 │      → build/shipper/<Scheme>.xcarchive
 │
 ├─ 6. Export IPA
-│      Generates ExportOptions.plist from shipper.toml
+│      ExportOptions.plist: method=app-store-connect, destination=export
 │      xcodebuild -exportArchive → build/shipper/ipa/<App>.ipa
 │
 ├─ 7. Upload
+│      Copies .p8 key to ~/.appstoreconnect/private_keys/ if needed
 │      xcrun altool --upload-app --apiKey ... --apiIssuer ...
 │
 ├─ 8. Poll App Store Connect  [skipped if asc_app_id not set]
-│      GET /v1/builds?filter[app]=...
+│      GET /v1/builds?filter[app]=...&filter[version]=<build_number>
 │      Polls every 30s until processingState == VALID (max 20 min)
 │
 └─ 9. Notify
@@ -165,14 +175,18 @@ shipper deploy android
 
 ```
 ~/.shipper/
-├── config.toml          ← global credentials & notification settings
+├── config.toml              ← global credentials & notification settings
 └── keys/
-    ├── AuthKey_XXXX.p8  ← Apple App Store Connect API key (ES256)
-    ├── play-store.json  ← Google service account JSON (RS256)
-    ├── keystore-password← Android keystore password (plain text, chmod 600)
-    └── telegram-token   ← Telegram bot token (optional)
+    ├── AuthKey_XXXX.p8      ← Apple App Store Connect API key (ES256)
+    ├── play-store.json      ← Google service account JSON (RS256)
+    ├── keystore-password    ← Android keystore password (plain text, chmod 600)
+    ├── telegram-token       ← Telegram bot token (optional)
+    └── <bundle_id>/         ← per-app iOS signing credentials
+        ├── dist-cert.p12
+        ├── profile.mobileprovision
+        └── credentials.json ← { "certPassword": "..." }
 
-./shipper.toml           ← per-project: platform config, bundle IDs, schemes
+./shipper.toml               ← per-project: platform config, bundle IDs, schemes
 ```
 
 Config loading order:
