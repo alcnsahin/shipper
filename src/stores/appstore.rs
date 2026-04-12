@@ -98,9 +98,10 @@ pub async fn poll_build_processing(
         let jwt = generate_jwt(creds)?;
         let client = asc_client(&jwt);
 
+        // ASC API: filter[version] is the build number (CFBundleVersion), not the marketing version
         let url = format!(
             "{}/builds?filter[app]={}&filter[version]={}&sort=-uploadedDate&limit=5",
-            ASC_BASE, app_id, version
+            ASC_BASE, app_id, build_number
         );
 
         let res = client.get(&url).send().await?;
@@ -112,11 +113,7 @@ pub async fn poll_build_processing(
 
         let builds: BuildsResponse = res.json().await?;
 
-        // Find our specific build by build number
-        if let Some(build) = builds.data.iter().find(|b| {
-            // Build number is in a separate field; check version match
-            b.attributes.version == version
-        }) {
+        if let Some(build) = builds.data.first() {
             let state = match build.attributes.processing_state.as_str() {
                 "PROCESSING" | "RECEIVE" => ProcessingState::Processing,
                 "VALID" => ProcessingState::Valid,
