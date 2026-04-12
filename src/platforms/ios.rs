@@ -53,9 +53,20 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
         progress::step(3, total, "CocoaPods — skipped (no Podfile)");
     }
 
+    // Resolve actual scheme name from workspace (Expo prebuild may use different casing)
+    let resolved_scheme = resolve_scheme_from_workspace(ios).unwrap_or_else(|| ios.scheme.clone());
+    if resolved_scheme != ios.scheme {
+        println!(
+            "  {} Scheme auto-corrected: {} → {}",
+            style("i").dim(),
+            ios.scheme,
+            resolved_scheme
+        );
+    }
+
     // Step 4: Archive
     progress::step(4, total, "Archiving with xcodebuild");
-    let archive_path = archive(ios, &app_version).await?;
+    let archive_path = archive(ios, &resolved_scheme, &app_version).await?;
     progress::success(&format!("Archive created: {}", archive_path.display()));
 
     // Step 5: Export IPA
@@ -241,9 +252,45 @@ async fn pod_install(ios_dir: &Path) -> Result<()> {
 
 // ─── xcodebuild archive ───────────────────────────────────────────────────────
 
-async fn archive(ios: &IosConfig, version: &AppVersion) -> Result<PathBuf> {
+fn resolve_scheme_from_workspace(ios: &IosConfig) -> Option<String> {
+    let workspace = ios.workspace.as_ref()?;
+    let schemes_dir = PathBuf::from(workspace).join("xcshareddata/xcschemes");
+    let entries = std::fs::read_dir(&schemes_dir).ok()?;
+
+    let mut schemes: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("xcscheme") {
+                p.file_stem().and_then(|s| s.to_str()).map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Exact match — config is already correct
+    if schemes.iter().any(|s| s == &ios.scheme) {
+        return None;
+    }
+
+    // Case-insensitive match — return the correctly-cased name
+    let lower = ios.scheme.to_lowercase();
+    if let Some(matched) = schemes.iter().find(|s| s.to_lowercase() == lower) {
+        return Some(matched.clone());
+    }
+
+    // If only one scheme exists, use it
+    if schemes.len() == 1 {
+        return Some(schemes.remove(0));
+    }
+
+    None
+}
+
+async fn archive(ios: &IosConfig, scheme: &str, version: &AppVersion) -> Result<PathBuf> {
     let archive_path = PathBuf::from(&ios.build_dir)
-        .join(format!("{}.xcarchive", ios.scheme));
+        .join(format!("{}.xcarchive", scheme));
 
     std::fs::create_dir_all(&ios.build_dir)
         .context("Failed to create build directory")?;
@@ -253,7 +300,7 @@ async fn archive(ios: &IosConfig, version: &AppVersion) -> Result<PathBuf> {
         "-configuration".to_string(),
         ios.configuration.clone(),
         "-scheme".to_string(),
-        ios.scheme.clone(),
+        scheme.to_string(),
         "-archivePath".to_string(),
         archive_path.to_string_lossy().to_string(),
         "-destination".to_string(),

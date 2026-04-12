@@ -211,10 +211,11 @@ impl ProjectDefaults {
             d.ios_bundle_id = app_json["expo"]["ios"]["bundleIdentifier"]
                 .as_str()
                 .map(str::to_string);
-            d.ios_scheme = app_json["expo"]["scheme"]
+            // Expo uses expo.name for the Xcode scheme name (not expo.scheme,
+            // which is the deep-link URL scheme, nor expo.slug).
+            d.ios_scheme = app_json["expo"]["name"]
                 .as_str()
                 .or_else(|| app_json["expo"]["slug"].as_str())
-                .or_else(|| app_json["expo"]["name"].as_str())
                 .map(str::to_string);
             d.android_package = app_json["expo"]["android"]["package"]
                 .as_str()
