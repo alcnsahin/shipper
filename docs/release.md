@@ -154,8 +154,8 @@ Requires Rust 1.75+. Install via [rustup.rs](https://rustup.rs).
 ## Upgrade
 
 ```bash
-# Homebrew
-brew upgrade shipper
+# Homebrew — fetch latest formulas first, then upgrade
+brew update && brew upgrade shipper
 
 # Manual — re-run the same curl command
 curl -Lo shipper https://github.com/alcnsahin/shipper/releases/latest/download/shipper-macos-arm64
