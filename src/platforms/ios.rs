@@ -75,6 +75,10 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
         );
     }
 
+    // Ensure signing credentials are installed (cert in Keychain, profile on disk).
+    // Looks in ~/.shipper/keys/<bundle_id>/ then ./credentials/ios/ — installs automatically.
+    ensure_signing_setup(ios).await?;
+
     // Resolve signing config — use shipper.toml values, auto-detect, or prompt
     let (signing_profile, signing_identity) = resolve_signing_config(ios).await?;
 
@@ -353,6 +357,163 @@ fn collect_shared_schemes() -> Vec<String> {
         }
     }
     schemes
+}
+
+// ─── Signing setup (auto-install cert + profile) ─────────────────────────────
+
+/// Called before every deploy. Checks whether the distribution certificate
+/// and provisioning profile are already installed. If not, looks for them in:
+///   1. ~/.shipper/keys/<bundle_id>/
+///   2. ./credentials/ios/   (EAS download location)
+/// Installs whatever it finds, copies project-level files to ~/.shipper/keys/.
+async fn ensure_signing_setup(ios: &IosConfig) -> Result<()> {
+    let has_cert = detect_code_sign_identity().await.is_some();
+    let has_profile = detect_provisioning_profile(&ios.bundle_id).is_some();
+
+    if has_cert && has_profile {
+        return Ok(());
+    }
+
+    let shipper_dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("~"))
+        .join(".shipper/keys")
+        .join(&ios.bundle_id);
+
+    let search_dirs: &[PathBuf] = &[
+        shipper_dir.clone(),
+        PathBuf::from("credentials/ios"),
+    ];
+
+    if !has_cert {
+        let p12 = search_dirs.iter().map(|d| d.join("dist-cert.p12")).find(|p| p.exists());
+        match p12 {
+            Some(ref path) => {
+                let creds_json = search_dirs.iter().map(|d| d.join("credentials.json")).find(|p| p.exists());
+                let password = read_p12_password(creds_json.as_deref())?;
+                let spinner = progress::spinner("Installing distribution certificate to Keychain...");
+                import_certificate(path, &password)?;
+                spinner.finish_and_clear();
+                println!("  {} Distribution certificate installed", style("✓").green().bold());
+                // Persist to ~/.shipper/keys/<bundle_id>/ for future use
+                persist_to_shipper_keys(path, &shipper_dir, "dist-cert.p12")?;
+                if let Some(ref cj) = creds_json {
+                    persist_to_shipper_keys(cj, &shipper_dir, "credentials.json")?;
+                }
+            }
+            None => {
+                println!();
+                println!("  {} Distribution certificate not found.", style("!").yellow().bold());
+                println!("  Run the following to download it:");
+                println!("    eas credentials --platform ios");
+                println!("  Then move the files:");
+                println!("    mkdir -p ~/.shipper/keys/{}", ios.bundle_id);
+                println!("    mv credentials/ios/* ~/.shipper/keys/{}/", ios.bundle_id);
+                anyhow::bail!("Distribution certificate required — see instructions above");
+            }
+        }
+    }
+
+    if !has_profile {
+        let profile = search_dirs.iter().map(|d| d.join("profile.mobileprovision")).find(|p| p.exists());
+        match profile {
+            Some(ref path) => {
+                let spinner = progress::spinner("Installing provisioning profile...");
+                install_profile(path)?;
+                spinner.finish_and_clear();
+                println!("  {} Provisioning profile installed", style("✓").green().bold());
+                persist_to_shipper_keys(path, &shipper_dir, "profile.mobileprovision")?;
+            }
+            None => {
+                println!();
+                println!("  {} Provisioning profile not found.", style("!").yellow().bold());
+                println!("  Run: eas credentials --platform ios");
+                anyhow::bail!("Provisioning profile required — see instructions above");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn persist_to_shipper_keys(src: &Path, shipper_dir: &Path, filename: &str) -> Result<()> {
+    let dest = shipper_dir.join(filename);
+    if dest == src {
+        return Ok(()); // already there
+    }
+    std::fs::create_dir_all(shipper_dir)?;
+    std::fs::copy(src, &dest)?;
+    Ok(())
+}
+
+fn read_p12_password(creds_json: Option<&Path>) -> Result<String> {
+    if let Some(path) = creds_json {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                for key in &["certPassword", "password", "p12Password", "distributionCertificatePassword"] {
+                    if let Some(pw) = json[key].as_str() {
+                        return Ok(pw.to_string());
+                    }
+                }
+            }
+        }
+    }
+    print!("  P12 certificate password: ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
+fn import_certificate(p12_path: &Path, password: &str) -> Result<()> {
+    let login_keychain = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("~"))
+        .join("Library/Keychains/login.keychain-db");
+
+    let status = std::process::Command::new("security")
+        .args([
+            "import",
+            &p12_path.to_string_lossy(),
+            "-k", &login_keychain.to_string_lossy(),
+            "-P", password,
+            "-T", "/usr/bin/codesign",
+            "-T", "/usr/bin/security",
+            "-A",
+        ])
+        .status()
+        .context("Failed to run 'security import'")?;
+
+    if !status.success() {
+        anyhow::bail!(
+            "Failed to import certificate. Check that the password is correct.\n\
+             Password is in ~/.shipper/keys/<bundle_id>/credentials.json → certPassword"
+        );
+    }
+    Ok(())
+}
+
+fn install_profile(profile_path: &Path) -> Result<()> {
+    let data = std::fs::read(profile_path)?;
+    let text = String::from_utf8_lossy(&data);
+    let start = text.find("<?xml").context("Invalid mobileprovision file")?;
+    let end = text.find("</plist>").context("Invalid mobileprovision file")?;
+    let plist = &text[start..end + "</plist>".len()];
+
+    let uuid = extract_plist_string(plist, "UUID")
+        .context("Could not read UUID from provisioning profile")?;
+
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+    let candidates = [
+        home.join("Library/Developer/Xcode/UserData/Provisioning Profiles"),
+        home.join("Library/MobileDevice/Provisioning Profiles"),
+    ];
+    let dest_dir = candidates.iter()
+        .find(|p| p.exists())
+        .cloned()
+        .unwrap_or_else(|| candidates[0].clone());
+
+    std::fs::create_dir_all(&dest_dir)?;
+    std::fs::copy(profile_path, dest_dir.join(format!("{}.mobileprovision", uuid)))?;
+    Ok(())
 }
 
 // ─── Signing config resolution ────────────────────────────────────────────────
