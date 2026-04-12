@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use console::style;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
@@ -74,9 +75,19 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
         );
     }
 
+    // Resolve signing config — use shipper.toml values, auto-detect, or prompt
+    let (signing_profile, signing_identity) = resolve_signing_config(ios).await?;
+
     // Step 4: Archive
     progress::step(4, total, "Archiving with xcodebuild");
-    let archive_path = archive(ios, resolved_workspace.as_deref(), &resolved_scheme, &app_version).await?;
+    let archive_path = archive(
+        ios,
+        resolved_workspace.as_deref(),
+        &resolved_scheme,
+        signing_profile.as_deref(),
+        signing_identity.as_deref(),
+        &app_version,
+    ).await?;
     progress::success(&format!("Archive created: {}", archive_path.display()));
 
     // Step 5: Export IPA
@@ -343,7 +354,135 @@ fn collect_shared_schemes() -> Vec<String> {
     schemes
 }
 
-async fn archive(ios: &IosConfig, workspace: Option<&str>, scheme: &str, version: &AppVersion) -> Result<PathBuf> {
+// ─── Signing config resolution ────────────────────────────────────────────────
+
+async fn resolve_signing_config(ios: &IosConfig) -> Result<(Option<String>, Option<String>)> {
+    let profile = match &ios.provisioning_profile {
+        Some(p) => Some(p.clone()),
+        None => {
+            let detected = detect_provisioning_profile(&ios.bundle_id);
+            match detected {
+                Some(ref p) => {
+                    println!("  {} Provisioning profile detected: {}", style("i").dim(), p);
+                    detected
+                }
+                None => prompt_optional_signing("Provisioning profile name")?,
+            }
+        }
+    };
+
+    let identity = match &ios.code_sign_identity {
+        Some(i) => Some(i.clone()),
+        None => {
+            let detected = detect_code_sign_identity().await;
+            match detected {
+                Some(ref i) => {
+                    println!("  {} Code sign identity detected: {}", style("i").dim(), i);
+                    detected
+                }
+                None => prompt_optional_signing("Code sign identity (e.g. 'Apple Distribution: Company (TEAMID)')")?,
+            }
+        }
+    };
+
+    Ok((profile, identity))
+}
+
+/// Scan ~/Library/MobileDevice/Provisioning Profiles/ for a profile matching the bundle ID.
+/// Only returns App Store / distribution profiles (get-task-allow = false).
+fn detect_provisioning_profile(bundle_id: &str) -> Option<String> {
+    let profiles_dir = dirs::home_dir()?.join("Library/MobileDevice/Provisioning Profiles");
+    for entry in std::fs::read_dir(&profiles_dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("mobileprovision") {
+            continue;
+        }
+        if let Some(info) = read_mobileprovision(&path) {
+            // Skip development profiles
+            if info.is_development {
+                continue;
+            }
+            if info.bundle_id == bundle_id || info.bundle_id == format!("*.{}", bundle_id) {
+                return Some(info.name);
+            }
+        }
+    }
+    None
+}
+
+struct ProfileInfo {
+    name: String,
+    bundle_id: String,
+    is_development: bool,
+}
+
+fn read_mobileprovision(path: &Path) -> Option<ProfileInfo> {
+    let data = std::fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&data);
+    // The plist is embedded as plaintext inside the PKCS7 envelope
+    let start = text.find("<?xml")?;
+    let end = text.find("</plist>")?;
+    let plist = &text[start..end + "</plist>".len()];
+
+    let name = extract_plist_string(plist, "Name")?;
+    let app_id = extract_plist_string(plist, "application-identifier")?;
+    // Strip team prefix: "TEAMID.com.example.app" → "com.example.app"
+    let bundle_id = app_id.splitn(2, '.').nth(1).unwrap_or(&app_id).to_string();
+    let is_development = plist.contains("<key>get-task-allow</key>")
+        && plist
+            .split("<key>get-task-allow</key>")
+            .nth(1)
+            .map(|s| s.contains("<true/>"))
+            .unwrap_or(false);
+
+    Some(ProfileInfo { name, bundle_id, is_development })
+}
+
+fn extract_plist_string(plist: &str, key: &str) -> Option<String> {
+    let marker = format!("<key>{}</key>", key);
+    let after = plist.split(&marker).nth(1)?;
+    let start = after.find("<string>")? + "<string>".len();
+    let end = after.find("</string>")?;
+    Some(after[start..end].trim().to_string())
+}
+
+/// Get the first Apple Distribution identity from the Keychain.
+async fn detect_code_sign_identity() -> Option<String> {
+    let output = tokio::process::Command::new("security")
+        .args(["find-identity", "-v", "-p", "codesigning"])
+        .output()
+        .await
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if line.contains("Apple Distribution") {
+            if let (Some(s), Some(e)) = (line.find('"'), line.rfind('"')) {
+                if s < e {
+                    return Some(line[s + 1..e].to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn prompt_optional_signing(label: &str) -> Result<Option<String>> {
+    print!("  {} (optional, press Enter to skip): ", label);
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let trimmed = input.trim().to_string();
+    Ok(if trimmed.is_empty() { None } else { Some(trimmed) })
+}
+
+async fn archive(
+    ios: &IosConfig,
+    workspace: Option<&str>,
+    scheme: &str,
+    provisioning_profile: Option<&str>,
+    code_sign_identity: Option<&str>,
+    version: &AppVersion,
+) -> Result<PathBuf> {
     let archive_path = PathBuf::from(&ios.build_dir)
         .join(format!("{}.xcarchive", scheme));
 
@@ -371,11 +510,11 @@ async fn archive(ios: &IosConfig, workspace: Option<&str>, scheme: &str, version
         args.insert(1, "-project".to_string());
     }
 
-    if let Some(profile) = &ios.provisioning_profile {
+    if let Some(profile) = provisioning_profile {
         args.push(format!("PROVISIONING_PROFILE_SPECIFIER={}", profile));
     }
 
-    if let Some(identity) = &ios.code_sign_identity {
+    if let Some(identity) = code_sign_identity {
         args.push(format!("CODE_SIGN_IDENTITY={}", identity));
     }
 
