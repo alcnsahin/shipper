@@ -93,7 +93,7 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
 
     // Step 5: Export IPA
     progress::step(5, total, "Exporting IPA");
-    let ipa_path = export_ipa(ios, &archive_path).await?;
+    let ipa_path = export_ipa(ios, &archive_path, signing_profile.as_deref(), signing_identity.as_deref(), &apple.team_id).await?;
     progress::success(&format!("IPA: {}", ipa_path.display()));
 
     // Step 6: Upload to App Store Connect
@@ -576,10 +576,16 @@ async fn archive(
 
 // ─── Export IPA ───────────────────────────────────────────────────────────────
 
-async fn export_ipa(ios: &IosConfig, archive_path: &Path) -> Result<PathBuf> {
+async fn export_ipa(
+    ios: &IosConfig,
+    archive_path: &Path,
+    provisioning_profile: Option<&str>,
+    code_sign_identity: Option<&str>,
+    team_id: &str,
+) -> Result<PathBuf> {
     let export_path = PathBuf::from(&ios.build_dir).join("ipa");
 
-    let export_plist = generate_export_plist(ios);
+    let export_plist = generate_export_plist(ios, provisioning_profile, code_sign_identity, team_id);
     let plist_path = PathBuf::from(&ios.build_dir).join("ExportOptions.plist");
     std::fs::write(&plist_path, &export_plist)
         .context("Failed to write ExportOptions.plist")?;
@@ -614,8 +620,17 @@ async fn export_ipa(ios: &IosConfig, archive_path: &Path) -> Result<PathBuf> {
     Ok(ipa)
 }
 
-fn generate_export_plist(ios: &IosConfig) -> String {
-    let method = &ios.export_method;
+fn generate_export_plist(
+    ios: &IosConfig,
+    provisioning_profile: Option<&str>,
+    code_sign_identity: Option<&str>,
+    team_id: &str,
+) -> String {
+    // "app-store" was deprecated in Xcode 16 — use "app-store-connect"
+    let method = match ios.export_method.as_str() {
+        "app-store" => "app-store-connect",
+        other => other,
+    };
 
     let mut plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -625,21 +640,27 @@ fn generate_export_plist(ios: &IosConfig) -> String {
     <key>method</key>
     <string>{method}</string>
     <key>destination</key>
-    <string>upload</string>
+    <string>export</string>
+    <key>teamID</key>
+    <string>{team_id}</string>
+    <key>signingStyle</key>
+    <string>manual</string>
 "#
     );
 
-    if let Some(profile) = &ios.provisioning_profile {
+    let profile = provisioning_profile.or(ios.provisioning_profile.as_deref());
+    if let Some(p) = profile {
         plist.push_str(&format!(
             "    <key>provisioningProfiles</key>\n    <dict>\n        <key>{}</key>\n        <string>{}</string>\n    </dict>\n",
-            ios.bundle_id, profile
+            ios.bundle_id, p
         ));
     }
 
-    if let Some(identity) = &ios.code_sign_identity {
+    let identity = code_sign_identity.or(ios.code_sign_identity.as_deref());
+    if let Some(i) = identity {
         plist.push_str(&format!(
             "    <key>signingCertificate</key>\n    <string>{}</string>\n",
-            identity
+            i
         ));
     }
 
