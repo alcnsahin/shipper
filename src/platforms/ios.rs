@@ -684,11 +684,34 @@ fn find_ipa(export_path: &Path) -> Result<PathBuf> {
 
 // ─── Upload ───────────────────────────────────────────────────────────────────
 
+/// altool only searches a fixed set of directories for the .p8 key file.
+/// Copy it to ~/.appstoreconnect/private_keys/ so altool can find it.
+fn ensure_key_for_altool(apple: &AppleCredentials) -> Result<()> {
+    let src = crate::config::expand_path(&apple.key_path);
+    if !src.exists() {
+        anyhow::bail!(
+            "App Store Connect API key not found: {}\nCheck key_path in ~/.shipper/config.toml",
+            src.display()
+        );
+    }
+    let dest_dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("~"))
+        .join(".appstoreconnect/private_keys");
+    std::fs::create_dir_all(&dest_dir)?;
+    let dest = dest_dir.join(format!("AuthKey_{}.p8", apple.key_id));
+    if !dest.exists() {
+        std::fs::copy(&src, &dest).context("Failed to copy API key to ~/.appstoreconnect/private_keys/")?;
+    }
+    Ok(())
+}
+
 async fn upload_to_asc(
     _ios: &IosConfig,
     apple: &AppleCredentials,
     ipa_path: &Path,
 ) -> Result<()> {
+    ensure_key_for_altool(apple)?;
+
     let spinner = progress::spinner("Uploading IPA via xcrun altool...");
 
     let output = Command::new("xcrun")
