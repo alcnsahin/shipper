@@ -97,19 +97,23 @@ fn preflight_checks(ios: &IosConfig) -> Result<()> {
     check_tool("xcodebuild")?;
     check_tool("xcrun")?;
 
-    // Verify workspace/project exists
-    if let Some(ws) = &ios.workspace {
-        let path = Path::new(ws);
-        if !path.exists() {
-            anyhow::bail!("Workspace not found: {}", ws);
-        }
-    } else if let Some(proj) = &ios.project {
-        let path = Path::new(proj);
-        if !path.exists() {
-            anyhow::bail!("Project not found: {}", proj);
-        }
-    } else {
+    // Verify workspace/project is configured
+    if ios.workspace.is_none() && ios.project.is_none() {
         anyhow::bail!("Either [ios].workspace or [ios].project must be set in shipper.toml");
+    }
+
+    // For Expo projects, ios/ is created by expo prebuild — skip existence check here.
+    // For native projects, the workspace/project must already exist.
+    if !version::is_expo_project() {
+        if let Some(ws) = &ios.workspace {
+            if !Path::new(ws).exists() {
+                anyhow::bail!("Workspace not found: {}", ws);
+            }
+        } else if let Some(proj) = &ios.project {
+            if !Path::new(proj).exists() {
+                anyhow::bail!("Project not found: {}", proj);
+            }
+        }
     }
 
     spinner.finish_and_clear();

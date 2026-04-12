@@ -223,6 +223,14 @@ impl ProjectDefaults {
 
         d.ios_workspace = find_xcworkspace();
 
+        // For Expo projects, ios/ doesn't exist until after prebuild.
+        // Predict the workspace path from the scheme name so init can write it to shipper.toml.
+        if d.is_expo && d.ios_workspace.is_none() {
+            if let Some(ref scheme) = d.ios_scheme {
+                d.ios_workspace = Some(format!("ios/{}.xcworkspace", scheme));
+            }
+        }
+
         if let Some(eas) = read_eas_json() {
             d.asc_app_id = find_eas_ios_field(&eas, "ascAppId");
             d.apple_team_id = find_eas_ios_field(&eas, "appleTeamId");
