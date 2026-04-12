@@ -86,6 +86,7 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
         &resolved_scheme,
         signing_profile.as_deref(),
         signing_identity.as_deref(),
+        &apple.team_id,
         &app_version,
     ).await?;
     progress::success(&format!("Archive created: {}", archive_path.display()));
@@ -453,7 +454,7 @@ fn extract_plist_string(plist: &str, key: &str) -> Option<String> {
     Some(after[start..end].trim().to_string())
 }
 
-/// Get the first Apple Distribution identity from the Keychain.
+/// Get the first Apple/iPhone Distribution identity from the Keychain.
 async fn detect_code_sign_identity() -> Option<String> {
     let output = tokio::process::Command::new("security")
         .args(["find-identity", "-v", "-p", "codesigning"])
@@ -462,7 +463,7 @@ async fn detect_code_sign_identity() -> Option<String> {
         .ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
-        if line.contains("Apple Distribution") {
+        if line.contains("Apple Distribution") || line.contains("iPhone Distribution") {
             if let (Some(s), Some(e)) = (line.find('"'), line.rfind('"')) {
                 if s < e {
                     return Some(line[s + 1..e].to_string());
@@ -488,6 +489,7 @@ async fn archive(
     scheme: &str,
     provisioning_profile: Option<&str>,
     code_sign_identity: Option<&str>,
+    team_id: &str,
     version: &AppVersion,
 ) -> Result<PathBuf> {
     let archive_path = PathBuf::from(&ios.build_dir)
@@ -516,6 +518,8 @@ async fn archive(
         args.insert(1, proj.clone());
         args.insert(1, "-project".to_string());
     }
+
+    args.push(format!("DEVELOPMENT_TEAM={}", team_id));
 
     if let Some(profile) = provisioning_profile {
         args.push(format!("PROVISIONING_PROFILE_SPECIFIER={}", profile));
