@@ -396,15 +396,26 @@ async fn archive(ios: &IosConfig, workspace: Option<&str>, scheme: &str, version
     spinner.finish_and_clear();
 
     if !output.status.success() {
+        // xcodebuild writes build logs to stdout and errors to stderr.
+        // Combine both and extract lines containing "error:" for a clean message.
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Extract the error lines for a cleaner message
-        let errors: Vec<&str> = stderr
+        let combined = format!("{}\n{}", stdout, stderr);
+
+        let errors: Vec<&str> = combined
             .lines()
-            .filter(|l| l.contains("error:"))
-            .take(10)
+            .filter(|l| {
+                let l = l.trim();
+                l.contains("error:") && !l.starts_with("//")
+            })
+            .take(15)
             .collect();
+
         if errors.is_empty() {
-            anyhow::bail!("xcodebuild archive failed:\n{}", stderr.trim());
+            // Fall back to last 20 lines of stdout which usually has the summary
+            let last_lines: Vec<&str> = stdout.lines().rev().take(20).collect::<Vec<_>>()
+                .into_iter().rev().collect();
+            anyhow::bail!("xcodebuild archive failed:\n{}", last_lines.join("\n"));
         } else {
             anyhow::bail!("xcodebuild archive failed:\n{}", errors.join("\n"));
         }
