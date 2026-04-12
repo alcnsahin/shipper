@@ -14,6 +14,17 @@ Expo-aware: detects `app.json` and runs `expo prebuild` automatically.
 
 ---
 
+```
+  ·   *   ·   *
+       ╱▲╲
+      │APP│  shipper 0.1.5
+      │───│  ship it.
+      ╰─┬─╯
+        │
+       ╱│╲
+      · · ·
+```
+
 ## Why Shipper?
 
 If you've ever thought:
