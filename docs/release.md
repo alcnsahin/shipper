@@ -36,11 +36,11 @@ git tag v1.2.3
 git push origin v1.2.3
 ```
 
-Tag push'u GitHub Actions workflow'unu tetikler. Tag adı `v` ile başlamak zorunda (`v*` pattern).
+Pushing a tag triggers the GitHub Actions release workflow. The tag name must start with `v` (`v*` pattern).
 
 ### Pre-release tag
 
-Tag adında `-` içerirse GitHub Release otomatik olarak **pre-release** işaretlenir:
+If the tag name contains `-`, the GitHub Release is automatically marked as **pre-release**:
 
 ```bash
 git tag v1.2.3-beta
@@ -51,18 +51,18 @@ git push origin v1.2.3-beta
 ### List tags
 
 ```bash
-git tag                        # local tags
+git tag                          # local tags
 git tag --sort=-version:refname  # sorted descending
-git ls-remote --tags origin    # remote tags
+git ls-remote --tags origin      # remote tags
 ```
 
 ### Delete a tag
 
 ```bash
-# Local
+# Local only
 git tag -d v1.2.3
 
-# Remote
+# Remote only
 git push origin --delete v1.2.3
 
 # Both at once
@@ -71,10 +71,10 @@ git tag -d v1.2.3 && git push origin --delete v1.2.3
 
 ### Retag (overwrite an existing tag)
 
-Yanlış commit'e tag attıysan:
+If you tagged the wrong commit:
 
 ```bash
-# Delete old
+# Delete the old tag
 git tag -d v1.2.3
 git push origin --delete v1.2.3
 
@@ -83,21 +83,20 @@ git tag v1.2.3
 git push origin v1.2.3
 ```
 
-> **Not:** Workflow daha önce çalıştıysa GitHub Release ve homebrew formula zaten oluşmuştur.
-> Retaglemeden önce GitHub'da ilgili Release'i de silmen gerekir.
+> **Note:** If the workflow already ran, a GitHub Release and Homebrew formula have already been created.
+> Delete the corresponding GitHub Release before retagging.
 
 ---
 
 ## Re-running a Failed Workflow
 
-Workflow build sırasında hata aldıysa tag'i silip yeniden oluşturmak yerine
-GitHub Actions üzerinden yeniden tetikleyebilirsin:
+If the workflow fails mid-build, you can re-trigger it from GitHub Actions instead of deleting and recreating the tag:
 
 ```
 GitHub → alcnsahin/shipper → Actions → Release → Re-run all jobs
 ```
 
-Veya tag'i sil/yeniden oluştur:
+Or delete and recreate the tag:
 
 ```bash
 git tag -d v1.2.3 && git push origin --delete v1.2.3
@@ -108,15 +107,15 @@ git tag v1.2.3 && git push origin v1.2.3
 
 ## Installation
 
-### macOS — Homebrew (önerilen)
+### macOS — Homebrew (recommended)
 
 ```bash
 brew tap alcnsahin/tap
 brew install shipper
 ```
 
-`brew tap alcnsahin/tap` → GitHub'da `alcnsahin/homebrew-tap` reposunu ekler.
-Bu repo, her release'de workflow tarafından otomatik güncellenir.
+`brew tap alcnsahin/tap` adds the `alcnsahin/homebrew-tap` GitHub repository as a Homebrew tap.
+This repository is automatically updated by the release workflow on every new tag.
 
 ### macOS / Linux — Direct download
 
@@ -136,8 +135,8 @@ chmod +x shipper && sudo mv shipper /usr/local/bin/
 
 ### Windows
 
-[Releases sayfasından](https://github.com/alcnsahin/shipper/releases/latest) `shipper-windows-x86_64.exe`'yi indir,
-`shipper.exe` olarak yeniden adlandır ve PATH'te olan bir dizine koy.
+Download `shipper-windows-x86_64.exe` from the [latest release](https://github.com/alcnsahin/shipper/releases/latest),
+rename it to `shipper.exe`, and place it in any directory on your `PATH`.
 
 ### Build from source
 
@@ -148,7 +147,7 @@ cargo build --release
 sudo mv target/release/shipper /usr/local/bin/
 ```
 
-Rust 1.75+ gerektirir. → [rustup.rs](https://rustup.rs)
+Requires Rust 1.75+. Install via [rustup.rs](https://rustup.rs).
 
 ---
 
@@ -158,7 +157,7 @@ Rust 1.75+ gerektirir. → [rustup.rs](https://rustup.rs)
 # Homebrew
 brew upgrade shipper
 
-# Manuel — aynı curl komutunu tekrar çalıştır
+# Manual — re-run the same curl command
 curl -Lo shipper https://github.com/alcnsahin/shipper/releases/latest/download/shipper-macos-arm64
 chmod +x shipper && sudo mv shipper /usr/local/bin/
 ```
@@ -176,12 +175,12 @@ shipper --help
 
 ## How Homebrew Formula Works
 
-`brew install shipper` çalıştırıldığında Homebrew şu adımları izler:
+When you run `brew install shipper`, Homebrew performs the following steps:
 
-1. `alcnsahin/homebrew-tap` reposundaki `Formula/shipper.rb` dosyasını okur
-2. CPU mimarisine göre (`on_arm` / `on_intel`) doğru binary URL'ini seçer
-3. Binary'yi GitHub Releases'ten indirir
-4. SHA256 hash'ini formüldeki değerle karşılaştırır — eşleşmezse hata verir
-5. Binary'yi `/opt/homebrew/bin/shipper` (ARM) veya `/usr/local/bin/shipper` (Intel) olarak kurar
+1. Reads `Formula/shipper.rb` from the `alcnsahin/homebrew-tap` repository
+2. Detects CPU architecture and selects the correct binary URL (`on_arm` / `on_intel`)
+3. Downloads the binary from GitHub Releases
+4. Verifies the SHA256 hash against the value in the formula — aborts if they don't match
+5. Installs the binary as `shipper` into `/opt/homebrew/bin/` (ARM) or `/usr/local/bin/` (Intel)
 
-Kaynak build yoktur, Rust kurulumu gerekmez.
+No source build. No Rust installation required.

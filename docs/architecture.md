@@ -80,7 +80,7 @@ shipper/
 │       └── logger.rs            # tracing-subscriber init
 ├── .github/
 │   └── workflows/
-│       └── release.yml          # CI: build + GitHub Release + homebrew update
+│       └── release.yml          # CI: build + GitHub Release + Homebrew update
 ├── Cargo.toml
 └── docs/
     ├── architecture.md
@@ -175,7 +175,7 @@ shipper deploy android
 ./shipper.toml           ← per-project: platform config, bundle IDs, schemes
 ```
 
-Config yükleme sırası:
+Config loading order:
 
 ```rust
 Config::load()
@@ -194,14 +194,14 @@ Config::load()
     │
     ▼
 ES256 JWT
-  header: { alg: ES256, kid: KEY_ID }
+  header:  { alg: ES256, kid: KEY_ID }
   payload: { iss: ISSUER_ID, iat: now, exp: now+1200, aud: appstoreconnect-v1 }
     │
     ▼
 Authorization: Bearer <jwt>   →   api.appstoreconnect.apple.com
 ```
 
-Token TTL: 20 dakika (Apple limiti). Her API çağrısından önce yeniden üretilir.
+Token TTL: 20 minutes (Apple limit). Regenerated before each API call.
 
 ### Google — Play Store API
 
@@ -222,26 +222,26 @@ Authorization: Bearer <token>  →  androidpublisher.googleapis.com
 
 ## Version Bump Strategy
 
-| Proje tipi | Dosya | Alan |
-|------------|-------|------|
-| Expo / iOS | `app.json` | `expo.ios.buildNumber` |
-| Expo / Android | `app.json` | `expo.android.versionCode` |
-| Native iOS | `ios/*/Info.plist` | `CFBundleVersion`, `CFBundleShortVersionString` |
-| Native Android | `android/app/build.gradle` | `versionCode`, `versionName` |
+| Project type   | File                              | Field                                          |
+|----------------|-----------------------------------|------------------------------------------------|
+| Expo / iOS     | `app.json`                        | `expo.ios.buildNumber`                         |
+| Expo / Android | `app.json`                        | `expo.android.versionCode`                     |
+| Native iOS     | `ios/*/Info.plist`                | `CFBundleVersion`, `CFBundleShortVersionString` |
+| Native Android | `android/app/build.gradle`        | `versionCode`, `versionName`                   |
 
-`auto_increment = true` (default) her deploy'da build number'ı 1 artırır.
+`auto_increment = true` (default) increments the build number by 1 on every deploy.
 
 ---
 
 ## Error Handling
 
-| Katman | Strateji |
-|--------|----------|
-| Preflight | Araçlar yoksa deploy başlamadan çıkar |
-| Build hataları | `xcodebuild` / `gradle` stderr'den ilk 10-15 satır alınır |
-| API hataları | HTTP status + response body gösterilir |
-| ASC processing | 20 dk timeout, 30s polling interval |
-| Notification | Non-fatal — bildirim hatası deploy'u durdurmaz |
+| Layer        | Strategy                                                        |
+|--------------|-----------------------------------------------------------------|
+| Preflight    | Exits before starting if required tools are missing             |
+| Build errors | First 10–15 lines of `xcodebuild` / `gradle` stderr are shown  |
+| API errors   | HTTP status + response body are surfaced                        |
+| ASC processing | 20-minute timeout, 30-second polling interval                |
+| Notification | Non-fatal — a failed notification never aborts a deploy         |
 
 ---
 
@@ -260,25 +260,25 @@ git push origin v1.2.3
         └─ [windows]  cargo build --target x86_64-pc-windows-msvc
         │
         ▼
-GitHub Release  (tag adında '-' varsa: prerelease)
-  + SHA256 hesapla
+GitHub Release  (marked prerelease if tag contains '-')
+  + compute SHA256 of macOS binaries
         │
         ▼
-alcnsahin/homebrew-tap → Formula/shipper.rb güncelle
+alcnsahin/homebrew-tap → Formula/shipper.rb updated
         │
         ▼
-brew upgrade shipper   ← kullanıcı tarafında
+brew upgrade shipper   ← user side
 ```
 
 ---
 
 ## Key Design Decisions
 
-| Karar | Neden |
-|-------|-------|
-| Rust | Single binary, zero runtime deps, fast startup |
-| `rustls` yerine `native-tls` yok | musl static build ile uyumluluk |
-| `xcrun altool` | Tek subprocess çağrısı, Apple toolchain'e dahil |
-| Google Play edit/commit modeli | Atomik upload: commit çağrılmadıkça store'a yansımaz |
-| Secrets dosyadan okunur | `.env` veya env var yerine `chmod 600` dosyalar — daha explicit |
-| Expo auto-detect | `app.json` varlığına bakılır, prebuild otomatik çalışır |
+| Decision | Reason |
+|----------|--------|
+| Rust | Single binary, zero runtime dependencies, fast startup |
+| `rustls` instead of `native-tls` | Compatible with musl static builds — no OpenSSL dependency |
+| `xcrun altool` | Single subprocess call, included with Apple's Xcode toolchain |
+| Google Play edit/commit model | Atomic upload: changes are not published until `commit` is called |
+| Secrets read from files | Explicit `chmod 600` files instead of env vars or `.env` — harder to accidentally leak |
+| Expo auto-detect | Detects `app.json` presence and runs `prebuild` automatically |
