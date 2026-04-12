@@ -388,10 +388,17 @@ async fn resolve_signing_config(ios: &IosConfig) -> Result<(Option<String>, Opti
     Ok((profile, identity))
 }
 
-/// Scan ~/Library/MobileDevice/Provisioning Profiles/ for a profile matching the bundle ID.
+/// Scan known provisioning profile directories for a profile matching the bundle ID.
 /// Only returns App Store / distribution profiles (get-task-allow = false).
+/// Xcode 15+ uses ~/Library/Developer/Xcode/UserData/Provisioning Profiles/
+/// Older versions use ~/Library/MobileDevice/Provisioning Profiles/
 fn detect_provisioning_profile(bundle_id: &str) -> Option<String> {
-    let profiles_dir = dirs::home_dir()?.join("Library/MobileDevice/Provisioning Profiles");
+    let home = dirs::home_dir()?;
+    let candidates = [
+        home.join("Library/Developer/Xcode/UserData/Provisioning Profiles"),
+        home.join("Library/MobileDevice/Provisioning Profiles"),
+    ];
+    let profiles_dir = candidates.iter().find(|p| p.exists())?.clone();
     for entry in std::fs::read_dir(&profiles_dir).ok()?.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("mobileprovision") {
