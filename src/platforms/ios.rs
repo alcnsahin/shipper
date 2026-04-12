@@ -286,22 +286,15 @@ fn scan_for_xcworkspace() -> Option<String> {
     None
 }
 
-fn find_scheme_in_workspace(workspace: &str, configured_scheme: &str) -> Option<String> {
-    let schemes_dir = PathBuf::from(workspace).join("xcshareddata/xcschemes");
-    let schemes: Vec<String> = std::fs::read_dir(&schemes_dir)
-        .ok()?
-        .flatten()
-        .filter_map(|e| {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) == Some("xcscheme") {
-                p.file_stem().and_then(|s| s.to_str()).map(str::to_string)
-            } else {
-                None
-            }
-        })
-        .collect();
+fn find_scheme_in_workspace(_workspace: &str, configured_scheme: &str) -> Option<String> {
+    // Expo puts .xcscheme inside the .xcodeproj, not the .xcworkspace.
+    // Scan all .xcworkspace and .xcodeproj dirs in ios/ (skip Pods and xcuserdata).
+    let schemes = collect_shared_schemes();
 
-    // Exact match — already correct, no change needed
+    if schemes.is_empty() {
+        return None;
+    }
+    // Exact match — already correct
     if schemes.iter().any(|s| s == configured_scheme) {
         return None;
     }
@@ -315,6 +308,39 @@ fn find_scheme_in_workspace(workspace: &str, configured_scheme: &str) -> Option<
         return Some(schemes[0].clone());
     }
     None
+}
+
+/// Collect all shared scheme names from ios/*.xcworkspace and ios/*.xcodeproj
+/// (xcshareddata/xcschemes only — skips Pods and per-user xcuserdata).
+fn collect_shared_schemes() -> Vec<String> {
+    let mut schemes = Vec::new();
+    let ios_entries = match std::fs::read_dir("ios") {
+        Ok(e) => e,
+        Err(_) => return schemes,
+    };
+    for entry in ios_entries.flatten() {
+        let path = entry.path();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext != "xcworkspace" && ext != "xcodeproj" {
+            continue;
+        }
+        // Skip CocoaPods umbrella project
+        if path.file_stem().and_then(|s| s.to_str()) == Some("Pods") {
+            continue;
+        }
+        let schemes_dir = path.join("xcshareddata/xcschemes");
+        if let Ok(entries) = std::fs::read_dir(&schemes_dir) {
+            for se in entries.flatten() {
+                let sp = se.path();
+                if sp.extension().and_then(|e| e.to_str()) == Some("xcscheme") {
+                    if let Some(name) = sp.file_stem().and_then(|s| s.to_str()) {
+                        schemes.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    schemes
 }
 
 async fn archive(ios: &IosConfig, workspace: Option<&str>, scheme: &str, version: &AppVersion) -> Result<PathBuf> {
