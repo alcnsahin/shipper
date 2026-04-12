@@ -1,5 +1,7 @@
 # Shipper
 
+> **Early Beta** — Shipper is functional but under active development. Expect rough edges. Feedback and bug reports are welcome via [GitHub Issues](https://github.com/alcnsahin/shipper/issues).
+
 **Deploy iOS and Android apps to the App Store and Play Store from your Mac — with a single command.**
 
 No EAS. No Fastlane. No GitHub Actions. No cloud build services. No Ruby. No YAML.
