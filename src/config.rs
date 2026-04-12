@@ -81,7 +81,7 @@ pub struct IosConfig {
     pub project: Option<String>,
     pub scheme: String,
     pub bundle_id: String,
-    pub asc_app_id: String,
+    pub asc_app_id: Option<String>,
     #[serde(default = "default_export_method")]
     pub export_method: String,
     pub provisioning_profile: Option<String>,

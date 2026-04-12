@@ -53,7 +53,20 @@ pub async fn run() -> Result<()> {
         let workspace = prompt_optional("  Workspace path", detected.ios_workspace.as_deref())?;
         let scheme = prompt("  Scheme", detected.ios_scheme.as_deref())?;
         let bundle_id = prompt("  Bundle ID", detected.ios_bundle_id.as_deref())?;
-        let asc_app_id = prompt("  App Store Connect App ID", detected.asc_app_id.as_deref())?;
+        let asc_app_id = prompt_optional(
+            "  App Store Connect App ID (leave empty if app doesn't exist yet)",
+            detected.asc_app_id.as_deref(),
+        )?;
+        if asc_app_id.is_none() {
+            println!(
+                "  {} First upload: create the app at appstoreconnect.apple.com → Apps → +",
+                style("i").dim()
+            );
+            println!(
+                "  {} Then add asc_app_id to shipper.toml to enable build status polling.",
+                style("i").dim()
+            );
+        }
         Some(IosInputs { workspace, scheme, bundle_id, asc_app_id })
     } else {
         None
@@ -157,7 +170,7 @@ struct IosInputs {
     workspace: Option<String>,
     scheme: String,
     bundle_id: String,
-    asc_app_id: String,
+    asc_app_id: Option<String>,
 }
 
 struct AndroidInputs {
@@ -373,13 +386,16 @@ fn generate_project_config(
             Some(ws) => format!("workspace = \"{}\"\n", ws),
             None => "# workspace = \"ios/MyApp.xcworkspace\"\n".to_string(),
         };
+        let asc_line = match &ios.asc_app_id {
+            Some(id) => format!("asc_app_id = \"{}\"\n", id),
+            None => "# asc_app_id = \"\"  # Add after creating app in App Store Connect\n".to_string(),
+        };
         out.push_str(&format!(
             r#"
 [ios]
 {workspace_line}scheme = "{scheme}"
 bundle_id = "{bundle_id}"
-asc_app_id = "{asc_app_id}"
-export_method = "app-store"
+{asc_line}export_method = "app-store"
 # provisioning_profile = "MyApp AppStore"
 # code_sign_identity = "Apple Distribution: Company Name (TEAMID)"
 configuration = "Release"
@@ -387,7 +403,7 @@ configuration = "Release"
             workspace_line = workspace_line,
             scheme = ios.scheme,
             bundle_id = ios.bundle_id,
-            asc_app_id = ios.asc_app_id,
+            asc_line = asc_line,
         ));
     }
 

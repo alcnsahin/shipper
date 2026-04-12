@@ -8,7 +8,8 @@ use crate::stores::appstore;
 use crate::utils::progress;
 use crate::utils::version::{self, AppVersion};
 
-const TOTAL_STEPS: usize = 7;
+const TOTAL_STEPS_WITH_POLL: usize = 7;
+const TOTAL_STEPS_NO_POLL: usize = 6;
 
 pub async fn deploy(config: &Config) -> Result<AppVersion> {
     let ios = config.ios_config()?;
@@ -16,11 +17,17 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
 
     preflight_checks(ios)?;
 
+    let total = if ios.asc_app_id.is_some() {
+        TOTAL_STEPS_WITH_POLL
+    } else {
+        TOTAL_STEPS_NO_POLL
+    };
+
     println!("{}", style("iOS Pipeline").bold().underlined());
     println!();
 
     // Step 1: Version bump
-    progress::step(1, TOTAL_STEPS, "Bumping version");
+    progress::step(1, total, "Bumping version");
     let app_version = bump_version(config, ios)?;
     progress::success(&format!(
         "{} ({})",
@@ -29,48 +36,55 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
 
     // Step 2: Expo prebuild (if applicable)
     if version::is_expo_project() {
-        progress::step(2, TOTAL_STEPS, "Running expo prebuild");
+        progress::step(2, total, "Running expo prebuild");
         expo_prebuild().await?;
         progress::success("Expo prebuild complete");
     } else {
-        progress::step(2, TOTAL_STEPS, "Expo prebuild — skipped (not an Expo project)");
+        progress::step(2, total, "Expo prebuild — skipped (not an Expo project)");
     }
 
     // Step 3: Pod install
     let ios_dir = resolve_ios_dir(ios);
     if ios_dir.join("Podfile").exists() {
-        progress::step(3, TOTAL_STEPS, "Installing CocoaPods");
+        progress::step(3, total, "Installing CocoaPods");
         pod_install(&ios_dir).await?;
         progress::success("Pods installed");
     } else {
-        progress::step(3, TOTAL_STEPS, "CocoaPods — skipped (no Podfile)");
+        progress::step(3, total, "CocoaPods — skipped (no Podfile)");
     }
 
     // Step 4: Archive
-    progress::step(4, TOTAL_STEPS, "Archiving with xcodebuild");
+    progress::step(4, total, "Archiving with xcodebuild");
     let archive_path = archive(ios, &app_version).await?;
     progress::success(&format!("Archive created: {}", archive_path.display()));
 
     // Step 5: Export IPA
-    progress::step(5, TOTAL_STEPS, "Exporting IPA");
+    progress::step(5, total, "Exporting IPA");
     let ipa_path = export_ipa(ios, &archive_path).await?;
     progress::success(&format!("IPA: {}", ipa_path.display()));
 
     // Step 6: Upload to App Store Connect
-    progress::step(6, TOTAL_STEPS, "Uploading to App Store Connect");
+    progress::step(6, total, "Uploading to App Store Connect");
     upload_to_asc(ios, apple, &ipa_path).await?;
     progress::success("Upload complete");
 
-    // Step 7: Wait for processing
-    progress::step(7, TOTAL_STEPS, "Waiting for App Store Connect processing");
-    let build_id = appstore::poll_build_processing(
-        apple,
-        &ios.asc_app_id,
-        &app_version.version_name,
-        &app_version.build_number.to_string(),
-    )
-    .await?;
-    progress::success(&format!("Build processed (id: {})", build_id));
+    // Step 7: Poll processing (only if asc_app_id is set)
+    if let Some(asc_app_id) = &ios.asc_app_id {
+        progress::step(7, total, "Waiting for App Store Connect processing");
+        let build_id = appstore::poll_build_processing(
+            apple,
+            asc_app_id,
+            &app_version.version_name,
+            &app_version.build_number.to_string(),
+        )
+        .await?;
+        progress::success(&format!("Build processed (id: {})", build_id));
+    } else {
+        println!(
+            "  {} Build polling skipped — add asc_app_id to shipper.toml after creating the app in App Store Connect",
+            style("i").dim()
+        );
+    }
 
     Ok(app_version)
 }
