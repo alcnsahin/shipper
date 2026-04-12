@@ -61,13 +61,11 @@ jobs:
 
       - name: Rename binary (Unix)
         if: runner.os != 'Windows'
-        run: |
-          cp target/${{ matrix.target }}/release/shipper ${{ matrix.artifact }}
+        run: cp target/${{ matrix.target }}/release/shipper ${{ matrix.artifact }}
 
       - name: Rename binary (Windows)
         if: runner.os == 'Windows'
-        run: |
-          cp target/${{ matrix.target }}/release/shipper.exe ${{ matrix.artifact }}
+        run: cp target/${{ matrix.target }}/release/shipper.exe ${{ matrix.artifact }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -80,6 +78,9 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
+    outputs:
+      sha256_macos_arm64: ${{ steps.sha.outputs.macos_arm64 }}
+      sha256_macos_x86_64: ${{ steps.sha.outputs.macos_x86_64 }}
     steps:
       - uses: actions/checkout@v4
 
@@ -89,8 +90,11 @@ jobs:
           path: artifacts/
           merge-multiple: true
 
-      - name: List artifacts
-        run: ls -lh artifacts/
+      - name: Compute SHA256
+        id: sha
+        run: |
+          echo "macos_arm64=$(sha256sum artifacts/shipper-macos-arm64 | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "macos_x86_64=$(sha256sum artifacts/shipper-macos-x86_64 | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -101,3 +105,62 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  homebrew:
+    name: Update Homebrew Formula
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tap repo
+        uses: actions/checkout@v4
+        with:
+          repository: alcnsahin/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update formula
+        env:
+          VERSION: ${{ github.ref_name }}
+          SHA_ARM64: ${{ needs.release.outputs.sha256_macos_arm64 }}
+          SHA_X86_64: ${{ needs.release.outputs.sha256_macos_x86_64 }}
+        run: |
+          cat > homebrew-tap/Formula/shipper.rb << EOF
+          class Shipper < Formula
+            desc "Ship iOS and Android apps to the App Store and Play Store from your Mac"
+            homepage "https://github.com/alcnsahin/shipper"
+            version "${VERSION#v}"
+            license "LicenseRef-Proprietary"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/alcnsahin/shipper/releases/download/${VERSION}/shipper-macos-arm64"
+                sha256 "${SHA_ARM64}"
+              end
+              on_intel do
+                url "https://github.com/alcnsahin/shipper/releases/download/${VERSION}/shipper-macos-x86_64"
+                sha256 "${SHA_X86_64}"
+              end
+            end
+
+            def install
+              if Hardware::CPU.arm?
+                bin.install "shipper-macos-arm64" => "shipper"
+              else
+                bin.install "shipper-macos-x86_64" => "shipper"
+              end
+            end
+
+            test do
+              system bin/"shipper", "--version"
+            end
+          end
+          EOF
+
+      - name: Commit and push formula
+        run: |
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/shipper.rb
+          git commit -m "shipper ${{ github.ref_name }}"
+          git push
