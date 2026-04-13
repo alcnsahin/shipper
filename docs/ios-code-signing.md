@@ -56,20 +56,34 @@ If credentials are missing, shipper launches `eas credentials --platform ios` in
 
 ```
   i Signing credentials not found — launching EAS to download them...
+```
 
-  [EAS interactive prompts appear here]
-  1. Select build profile: production
-  2. Log in to your Apple account when prompted
-  3. Choose: credentials.json: Upload/Download credentials between EAS servers and your local json
-  4. Choose: Download credentials from EAS to credentials.json
+When the EAS prompt appears, navigate the menus as follows:
 
+```
+? Select a build profile  →  production
+
+? What do you want to do?
+  → Manage your iOS credentials
+    (logs in to Apple if needed)
+
+? What do you want to do?
+  → credentials.json: Upload/Download credentials between EAS servers and your local json
+
+? What do you want to do?
+  → Download credentials from EAS to credentials.json
+```
+
+EAS downloads the files to `./credentials/ios/`. Shipper then **moves** them to
+`~/.shipper/keys/<bundle_id>/` (the originals in `./credentials/ios/` are deleted) and
+installs them automatically:
+
+```
   ✓ Distribution certificate installed
   ✓ Provisioning profile installed
 ```
 
-After the first successful deploy, shipper copies the credentials to `~/.shipper/keys/<bundle_id>/`, so subsequent deploys are fully automatic with no EAS prompt.
-
-> **Important:** Add `credentials/` to `.gitignore` — EAS downloads private keys there temporarily.
+Subsequent deploys are fully automatic — no EAS prompt, credentials come from `~/.shipper/keys/<bundle_id>/`.
 
 ### Manual download (alternative)
 
@@ -77,10 +91,12 @@ If you prefer to download credentials separately before deploying:
 
 ```bash
 eas credentials --platform ios
+# Follow the same menu steps above
 # → downloads to ./credentials/ios/
 ```
 
-Then just run `shipper deploy ios` — it picks them up from `./credentials/ios/` automatically and copies them to `~/.shipper/keys/<bundle_id>/`.
+Then run `shipper deploy ios` — it picks them up from `./credentials/ios/`, moves them to
+`~/.shipper/keys/<bundle_id>/`, and deletes the originals from `./credentials/ios/`.
 
 ---
 

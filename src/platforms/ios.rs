@@ -462,8 +462,8 @@ async fn fetch_eas_credentials(_ios: &IosConfig, shipper_dir: &Path) -> Result<(
         anyhow::bail!("'eas credentials --platform ios' failed — cannot continue without signing credentials");
     }
 
-    // Copy any files EAS downloaded to ./credentials/ios/ into ~/.shipper/keys/<bundle_id>/
-    // so future deploys skip the EAS step entirely.
+    // Move any files EAS downloaded to ./credentials/ios/ into ~/.shipper/keys/<bundle_id>/
+    // and delete them from the project directory — private keys must not stay in source tree.
     let eas_dir = PathBuf::from("credentials/ios");
     for filename in &["dist-cert.p12", "profile.mobileprovision", "credentials.json"] {
         let src = eas_dir.join(filename);
@@ -471,6 +471,9 @@ async fn fetch_eas_credentials(_ios: &IosConfig, shipper_dir: &Path) -> Result<(
             persist_to_shipper_keys(&src, shipper_dir, filename).ok();
         }
     }
+    // Remove the now-empty EAS download directory
+    std::fs::remove_dir(&eas_dir).ok();
+    std::fs::remove_dir("credentials").ok();
 
     Ok(())
 }
@@ -482,6 +485,8 @@ fn persist_to_shipper_keys(src: &Path, shipper_dir: &Path, filename: &str) -> Re
     }
     std::fs::create_dir_all(shipper_dir)?;
     std::fs::copy(src, &dest)?;
+    // Delete the source so private keys don't linger outside ~/.shipper/keys/
+    std::fs::remove_file(src).ok();
     Ok(())
 }
 
