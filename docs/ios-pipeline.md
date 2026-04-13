@@ -68,10 +68,30 @@ See [iOS Code Signing Setup](ios-code-signing.md) for the full credential layout
 
 ### Step 1: Expo Prebuild (React Native/Expo only)
 
+Before running prebuild, shipper reads environment variables from `eas.json` for the
+configured build profile (default: `production`) and injects them into the process:
+
+```json
+// eas.json
+{
+  "build": {
+    "production": {
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://api.example.com",
+        "EXPO_PUBLIC_APP_KEY": "..."
+      }
+    }
+  }
+}
+```
+
+These env vars are available when `app.config.js` runs during prebuild, and again when
+Metro bundles the JavaScript during `xcodebuild archive`.
+
 ```bash
-if [ -f "app.json" ] && grep -q "expo" app.json; then
-    npx expo prebuild --platform ios --clean
-fi
+EXPO_PUBLIC_API_URL=https://api.example.com \
+EXPO_PUBLIC_APP_KEY=... \
+npx expo prebuild --platform ios --clean
 ```
 
 This generates the `ios/` directory with native Xcode project.
@@ -219,4 +239,5 @@ provisioning_profile = "MyApp AppStore"          # optional — auto-detected if
 code_sign_identity   = "Apple Distribution: Company (TEAMID)"  # optional — auto-detected
 configuration        = "Release"
 build_dir            = "build/shipper"           # default
+build_profile        = "production"              # eas.json build profile for env vars (default: "production")
 ```

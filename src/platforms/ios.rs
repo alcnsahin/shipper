@@ -35,10 +35,23 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
         app_version.version_name, app_version.build_number
     ));
 
+    // Read env vars from eas.json for the configured build profile.
+    // These are injected into expo prebuild and xcodebuild so EXPO_PUBLIC_* values
+    // are available when app.config.js runs and when Metro bundles the JS.
+    let eas_env = read_eas_env_vars(&ios.build_profile);
+    if !eas_env.is_empty() {
+        println!(
+            "  {} Using eas.json env vars from profile \"{}\" ({} vars)",
+            style("i").dim(),
+            ios.build_profile,
+            eas_env.len()
+        );
+    }
+
     // Step 2: Expo prebuild (if applicable)
     if version::is_expo_project() {
         progress::step(2, total, "Running expo prebuild");
-        expo_prebuild().await?;
+        expo_prebuild(&eas_env).await?;
         progress::success("Expo prebuild complete");
     } else {
         progress::step(2, total, "Expo prebuild — skipped (not an Expo project)");
@@ -92,6 +105,7 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
         signing_identity.as_deref(),
         &apple.team_id,
         &app_version,
+        &eas_env,
     ).await?;
     progress::success(&format!("Archive created: {}", archive_path.display()));
 
@@ -244,13 +258,42 @@ fn resolve_ios_dir(ios: &IosConfig) -> PathBuf {
 
 // ─── Expo prebuild ────────────────────────────────────────────────────────────
 
-async fn expo_prebuild() -> Result<()> {
-    run_command(
-        "npx",
-        &["expo", "prebuild", "--platform", "ios", "--clean"],
-        "Expo prebuild failed",
-    )
-    .await
+async fn expo_prebuild(env_vars: &std::collections::HashMap<String, String>) -> Result<()> {
+    let output = Command::new("npx")
+        .args(["expo", "prebuild", "--platform", "ios", "--clean"])
+        .envs(env_vars)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .context("Failed to run 'npx expo prebuild'")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Expo prebuild failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
+/// Read env vars from eas.json for the given build profile.
+/// Returns an empty map if eas.json is absent, unreadable, or has no env section.
+fn read_eas_env_vars(build_profile: &str) -> std::collections::HashMap<String, String> {
+    let content = match std::fs::read_to_string("eas.json") {
+        Ok(c) => c,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+    let env = &json["build"][build_profile]["env"];
+    match env.as_object() {
+        Some(obj) => obj
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect(),
+        None => std::collections::HashMap::new(),
+    }
 }
 
 // ─── CocoaPods ────────────────────────────────────────────────────────────────
@@ -697,6 +740,7 @@ async fn archive(
     code_sign_identity: Option<&str>,
     team_id: &str,
     version: &AppVersion,
+    eas_env: &std::collections::HashMap<String, String>,
 ) -> Result<PathBuf> {
     let archive_path = PathBuf::from(&ios.build_dir)
         .join(format!("{}.xcarchive", scheme));
@@ -743,6 +787,7 @@ async fn archive(
 
     let output = Command::new("xcodebuild")
         .args(&args)
+        .envs(eas_env)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()

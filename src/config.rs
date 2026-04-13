@@ -90,6 +90,10 @@ pub struct IosConfig {
     pub configuration: String,
     #[serde(default = "default_build_dir")]
     pub build_dir: String,
+    /// EAS build profile to read env vars from (default: "production").
+    /// Matches a key under `build` in eas.json.
+    #[serde(default = "default_build_profile")]
+    pub build_profile: String,
 }
 
 fn default_export_method() -> String {
@@ -102,6 +106,10 @@ fn default_configuration() -> String {
 
 fn default_build_dir() -> String {
     "build/shipper".to_string()
+}
+
+fn default_build_profile() -> String {
+    "production".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
