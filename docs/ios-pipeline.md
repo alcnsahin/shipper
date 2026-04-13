@@ -55,9 +55,14 @@ Before calling `xcrun altool`, shipper copies the `.p8` key to
 ### Step 0: Auto-install Signing Credentials
 
 Before the build starts, shipper verifies that a distribution certificate exists in
-Keychain and a matching provisioning profile is installed. If either is missing, it
-searches `~/.shipper/keys/<bundle_id>/` (then `./credentials/ios/`) and installs
-automatically.
+Keychain and a matching provisioning profile is installed. If either is missing, it:
+
+1. Searches `~/.shipper/keys/<bundle_id>/` then `./credentials/ios/`
+2. If still not found, **automatically runs `eas credentials --platform ios`** so you can download them interactively
+3. Copies downloaded files to `~/.shipper/keys/<bundle_id>/` for future runs
+4. Installs the certificate into Keychain and the profile into the Xcode profiles directory
+
+On first deploy to a new app, no manual credential setup is needed — just run `shipper deploy ios`.
 
 See [iOS Code Signing Setup](ios-code-signing.md) for the full credential layout.
 
@@ -192,8 +197,8 @@ Telegram / Slack → "MyApp v1.0.1 (42) → TestFlight ✅"
 
 | Error | Recovery |
 |-------|----------|
-| `requires a provisioning profile` | Place credential files in `~/.shipper/keys/<bundle_id>/` |
-| `0 valid identities found` | Place `dist-cert.p12` + `credentials.json` in `~/.shipper/keys/<bundle_id>/` |
+| `requires a provisioning profile` | Shipper auto-runs `eas credentials`; if that fails, check EAS project config |
+| `0 valid identities found` | Shipper auto-runs `eas credentials`; if that fails, place `dist-cert.p12` + `credentials.json` in `~/.shipper/keys/<bundle_id>/` |
 | `requires a development team` | Set `team_id` in `~/.shipper/config.toml → [credentials.apple]` |
 | `App Store Connect Credentials Error` | Check that `destination: export` is used in ExportOptions |
 | Upload 401 | JWT expired — regenerated automatically on next retry |

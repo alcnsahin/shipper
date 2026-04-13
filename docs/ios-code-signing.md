@@ -14,10 +14,11 @@ Before every `shipper deploy ios` run, shipper automatically:
 3. **If either is missing**, searches for credential files in:
    - `~/.shipper/keys/<bundle_id>/` (preferred persistent location)
    - `./credentials/ios/` (EAS CLI download location)
-4. **Installs** whatever it finds — certificate into Keychain, profile into the Xcode profiles directory
-5. **Copies** any files found in `./credentials/ios/` to `~/.shipper/keys/<bundle_id>/` so they work for future runs
+4. **If still not found**, runs `eas credentials --platform ios` automatically so you can authenticate and download credentials interactively
+5. **Copies** any downloaded files to `~/.shipper/keys/<bundle_id>/` so future runs skip the EAS step entirely
+6. **Installs** the credentials — certificate into Keychain, profile into the Xcode profiles directory
 
-No separate setup command is needed. Just place the files in the right location and run `shipper deploy ios`.
+No separate setup command is needed. On first deploy, shipper will launch EAS if credentials are missing.
 
 Once detected, shipper prints what it found:
 ```
@@ -43,58 +44,43 @@ To archive and upload an iOS app, two credential files must be available:
 
 ## Setup via EAS CLI (recommended)
 
-If your project uses Expo / EAS, this is the fastest path.
+If your project uses Expo / EAS, no manual setup is needed. Shipper handles everything automatically on first deploy.
 
-### Step 1 — Download credentials from EAS
-
-```bash
-eas credentials --platform ios
-```
-
-1. Select build profile: **production**
-2. Log in to your Apple account when prompted
-3. Choose: **credentials.json: Upload/Download credentials between EAS servers and your local json**
-4. Choose: **Download credentials from EAS to credentials.json**
-
-This creates files in your project:
-```
-credentials/
-  ios/
-    dist-cert.p12
-    profile.mobileprovision
-    credentials.json        ← contains the p12 password under "certPassword"
-```
-
-### Step 2 — Move credentials to shipper's key directory
-
-Shipper reads credentials from `~/.shipper/keys/<bundle_id>/`. Move the files there
-so they persist across projects and are never accidentally committed:
-
-```bash
-BUNDLE_ID="com.company.myapp"   # your actual bundle ID
-
-mkdir -p ~/.shipper/keys/$BUNDLE_ID
-mv credentials/ios/dist-cert.p12          ~/.shipper/keys/$BUNDLE_ID/
-mv credentials/ios/profile.mobileprovision ~/.shipper/keys/$BUNDLE_ID/
-mv credentials/ios/credentials.json        ~/.shipper/keys/$BUNDLE_ID/
-chmod 600 ~/.shipper/keys/$BUNDLE_ID/*
-
-# Remove the now-empty directory from your project
-rmdir credentials/ios credentials 2>/dev/null || true
-```
-
-> **Important:** Do not keep `credentials/` in your project directory — it contains private keys.
-> Add `credentials/` to `.gitignore` as a safety net.
-
-### Step 3 — Deploy
+### Just run deploy
 
 ```bash
 shipper deploy ios
 ```
 
-Shipper detects that the certificate and profile are not yet installed, finds the files in
-`~/.shipper/keys/<bundle_id>/`, reads the password from `credentials.json`, and installs
-everything automatically before proceeding with the build.
+If credentials are missing, shipper launches `eas credentials --platform ios` interactively:
+
+```
+  i Signing credentials not found — launching EAS to download them...
+
+  [EAS interactive prompts appear here]
+  1. Select build profile: production
+  2. Log in to your Apple account when prompted
+  3. Choose: credentials.json: Upload/Download credentials between EAS servers and your local json
+  4. Choose: Download credentials from EAS to credentials.json
+
+  ✓ Distribution certificate installed
+  ✓ Provisioning profile installed
+```
+
+After the first successful deploy, shipper copies the credentials to `~/.shipper/keys/<bundle_id>/`, so subsequent deploys are fully automatic with no EAS prompt.
+
+> **Important:** Add `credentials/` to `.gitignore` — EAS downloads private keys there temporarily.
+
+### Manual download (alternative)
+
+If you prefer to download credentials separately before deploying:
+
+```bash
+eas credentials --platform ios
+# → downloads to ./credentials/ios/
+```
+
+Then just run `shipper deploy ios` — it picks them up from `./credentials/ios/` automatically and copies them to `~/.shipper/keys/<bundle_id>/`.
 
 ---
 
@@ -185,11 +171,11 @@ The UUID is read from the profile's embedded plist.
 
 | Error | Cause | Fix |
 |---|---|---|
-| `requires a provisioning profile` | No profile found in either search location | Place `profile.mobileprovision` in `~/.shipper/keys/<bundle_id>/` |
-| `0 valid identities found` | Distribution cert not in Keychain and no `.p12` found | Place `dist-cert.p12` + `credentials.json` in `~/.shipper/keys/<bundle_id>/` |
+| `eas credentials failed` | EAS CLI not installed or auth failed | Run `npm i -g eas-cli` then `eas login` |
+| `not found after eas credentials` | EAS didn't download expected files | Check EAS project config; run `eas credentials` manually and verify `credentials/ios/` |
 | `Failed to import certificate` | Wrong p12 password | Check `certPassword` in `credentials.json` |
 | `xcodebuild archive failed` | Profile / cert mismatch | Ensure profile uses the same cert that is in Keychain |
-| `Certificate has been revoked` | Old cert revoked on Apple portal | Re-download via `eas credentials` or Developer Portal |
+| `Certificate has been revoked` | Old cert revoked on Apple portal | Delete `~/.shipper/keys/<bundle_id>/dist-cert.p12` and redeploy (triggers EAS re-download) |
 
 ---
 

@@ -365,7 +365,8 @@ fn collect_shared_schemes() -> Vec<String> {
 /// and provisioning profile are already installed. If not, looks for them in:
 ///   1. ~/.shipper/keys/<bundle_id>/
 ///   2. ./credentials/ios/   (EAS download location)
-/// Installs whatever it finds, copies project-level files to ~/.shipper/keys/.
+/// If still missing, runs `eas credentials --platform ios` automatically to
+/// download them, then copies to ~/.shipper/keys/<bundle_id>/ and installs.
 async fn ensure_signing_setup(ios: &IosConfig) -> Result<()> {
     let has_cert = detect_code_sign_identity().await.is_some();
     let has_profile = detect_provisioning_profile(&ios.bundle_id).is_some();
@@ -384,9 +385,16 @@ async fn ensure_signing_setup(ios: &IosConfig) -> Result<()> {
         PathBuf::from("credentials/ios"),
     ];
 
+    let find_cert = || search_dirs.iter().map(|d| d.join("dist-cert.p12")).find(|p| p.exists());
+    let find_profile = || search_dirs.iter().map(|d| d.join("profile.mobileprovision")).find(|p| p.exists());
+
+    // If anything is missing from both Xcode dirs and local disk, fetch via EAS automatically.
+    if (!has_cert && find_cert().is_none()) || (!has_profile && find_profile().is_none()) {
+        fetch_eas_credentials(ios, &shipper_dir).await?;
+    }
+
     if !has_cert {
-        let p12 = search_dirs.iter().map(|d| d.join("dist-cert.p12")).find(|p| p.exists());
-        match p12 {
+        match find_cert() {
             Some(ref path) => {
                 let creds_json = search_dirs.iter().map(|d| d.join("credentials.json")).find(|p| p.exists());
                 let password = read_p12_password(creds_json.as_deref())?;
@@ -394,28 +402,22 @@ async fn ensure_signing_setup(ios: &IosConfig) -> Result<()> {
                 import_certificate(path, &password)?;
                 spinner.finish_and_clear();
                 println!("  {} Distribution certificate installed", style("✓").green().bold());
-                // Persist to ~/.shipper/keys/<bundle_id>/ for future use
                 persist_to_shipper_keys(path, &shipper_dir, "dist-cert.p12")?;
                 if let Some(ref cj) = creds_json {
                     persist_to_shipper_keys(cj, &shipper_dir, "credentials.json")?;
                 }
             }
             None => {
-                println!();
-                println!("  {} Distribution certificate not found.", style("!").yellow().bold());
-                println!("  Run the following to download it:");
-                println!("    eas credentials --platform ios");
-                println!("  Then move the files:");
-                println!("    mkdir -p ~/.shipper/keys/{}", ios.bundle_id);
-                println!("    mv credentials/ios/* ~/.shipper/keys/{}/", ios.bundle_id);
-                anyhow::bail!("Distribution certificate required — see instructions above");
+                anyhow::bail!(
+                    "Distribution certificate not found after 'eas credentials'. \
+                     Check your EAS project configuration."
+                );
             }
         }
     }
 
     if !has_profile {
-        let profile = search_dirs.iter().map(|d| d.join("profile.mobileprovision")).find(|p| p.exists());
-        match profile {
+        match find_profile() {
             Some(ref path) => {
                 let spinner = progress::spinner("Installing provisioning profile...");
                 install_profile(path)?;
@@ -424,11 +426,49 @@ async fn ensure_signing_setup(ios: &IosConfig) -> Result<()> {
                 persist_to_shipper_keys(path, &shipper_dir, "profile.mobileprovision")?;
             }
             None => {
-                println!();
-                println!("  {} Provisioning profile not found.", style("!").yellow().bold());
-                println!("  Run: eas credentials --platform ios");
-                anyhow::bail!("Provisioning profile required — see instructions above");
+                anyhow::bail!(
+                    "Provisioning profile not found after 'eas credentials'. \
+                     Check your EAS project configuration."
+                );
             }
+        }
+    }
+
+    Ok(())
+}
+
+/// Runs `eas credentials --platform ios` interactively so the user can authenticate
+/// and download signing credentials. After EAS writes to ./credentials/ios/, copies
+/// the files to ~/.shipper/keys/<bundle_id>/ for future runs.
+async fn fetch_eas_credentials(_ios: &IosConfig, shipper_dir: &Path) -> Result<()> {
+    println!(
+        "  {} Signing credentials not found — launching EAS to download them...",
+        style("i").dim()
+    );
+    println!();
+
+    let status = tokio::process::Command::new("eas")
+        .args(["credentials", "--platform", "ios"])
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .await
+        .context("Failed to run 'eas credentials' — is EAS CLI installed? (npm i -g eas-cli)")?;
+
+    println!();
+
+    if !status.success() {
+        anyhow::bail!("'eas credentials --platform ios' failed — cannot continue without signing credentials");
+    }
+
+    // Copy any files EAS downloaded to ./credentials/ios/ into ~/.shipper/keys/<bundle_id>/
+    // so future deploys skip the EAS step entirely.
+    let eas_dir = PathBuf::from("credentials/ios");
+    for filename in &["dist-cert.p12", "profile.mobileprovision", "credentials.json"] {
+        let src = eas_dir.join(filename);
+        if src.exists() {
+            persist_to_shipper_keys(&src, shipper_dir, filename).ok();
         }
     }
 
