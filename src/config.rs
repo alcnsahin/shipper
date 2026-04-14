@@ -124,6 +124,8 @@ pub struct AndroidConfig {
     pub key_password_path: Option<String>,
     #[serde(default = "default_build_type")]
     pub build_type: String,
+    #[serde(default = "default_build_profile")]
+    pub build_profile: String,
 }
 
 fn default_track() -> String {

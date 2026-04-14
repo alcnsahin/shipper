@@ -9,14 +9,11 @@ use crate::stores::playstore;
 use crate::utils::progress;
 use crate::utils::version::{self, AppVersion};
 
-const TOTAL_STEPS: usize = 5;
+const TOTAL_STEPS: usize = 6;
 
 pub async fn deploy(config: &Config) -> Result<AppVersion> {
     let android = config.android_config()?;
     let google = config.google_credentials()?;
-
-    preflight_checks(android)?;
-    ensure_keystore_setup(android).await?;
 
     println!("{}", style("Android Pipeline").bold().underlined());
     println!();
@@ -29,26 +26,48 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
         app_version.version_name, app_version.build_number
     ));
 
-    // Step 2: Build
+    // Step 2: Expo prebuild (if applicable)
+    let eas_env = read_eas_env_vars(&android.build_profile);
+    if !eas_env.is_empty() {
+        println!(
+            "  {} Using eas.json env vars from profile \"{}\" ({} vars)",
+            style("i").dim(),
+            android.build_profile,
+            eas_env.len()
+        );
+    }
+    if version::is_expo_project() {
+        progress::step(2, TOTAL_STEPS, "Running expo prebuild");
+        expo_prebuild(&eas_env).await?;
+        progress::success("Expo prebuild complete");
+    } else {
+        progress::step(2, TOTAL_STEPS, "Expo prebuild — skipped (not an Expo project)");
+    }
+
+    // Preflight and keystore after prebuild so android/ directory exists
+    preflight_checks(android)?;
+    ensure_keystore_setup(android).await?;
+
+    // Step 3: Build
     let artifact_path = if android.build_type == "apk" {
-        progress::step(2, TOTAL_STEPS, "Building APK with Gradle");
+        progress::step(3, TOTAL_STEPS, "Building APK with Gradle");
         let path = build_apk(android).await?;
         progress::success(&format!("APK: {}", path.display()));
         path
     } else {
-        progress::step(2, TOTAL_STEPS, "Building AAB with Gradle");
+        progress::step(3, TOTAL_STEPS, "Building AAB with Gradle");
         let path = build_aab(android).await?;
         progress::success(&format!("AAB: {}", path.display()));
         path
     };
 
-    // Step 3: Sign
-    progress::step(3, TOTAL_STEPS, "Signing artifact");
+    // Step 4: Sign
+    progress::step(4, TOTAL_STEPS, "Signing artifact");
     let signed_path = sign_artifact(android, &artifact_path).await?;
     progress::success(&format!("Signed: {}", signed_path.display()));
 
-    // Step 4: Upload to Play Store
-    progress::step(4, TOTAL_STEPS, "Uploading to Play Store");
+    // Step 5: Upload to Play Store
+    progress::step(5, TOTAL_STEPS, "Uploading to Play Store");
     let version_code = playstore::upload_aab(
         google,
         &android.package_name,
@@ -58,8 +77,8 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
     .await?;
     progress::success(&format!("Uploaded (versionCode: {})", version_code));
 
-    // Step 5: Done
-    progress::step(5, TOTAL_STEPS, "Complete");
+    // Step 6: Done
+    progress::step(6, TOTAL_STEPS, "Complete");
     progress::success(&format!(
         "{} v{} ({}) → {} track",
         android.package_name,
@@ -69,6 +88,44 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
     ));
 
     Ok(app_version)
+}
+
+// ─── Expo prebuild ────────────────────────────────────────────────────────────
+
+async fn expo_prebuild(env_vars: &std::collections::HashMap<String, String>) -> Result<()> {
+    let output = tokio::process::Command::new("npx")
+        .args(["expo", "prebuild", "--platform", "android", "--clean"])
+        .envs(env_vars)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .context("Failed to run 'npx expo prebuild'")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Expo prebuild failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
+fn read_eas_env_vars(build_profile: &str) -> std::collections::HashMap<String, String> {
+    let content = match std::fs::read_to_string("eas.json") {
+        Ok(c) => c,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+    let env = &json["build"][build_profile]["env"];
+    match env.as_object() {
+        Some(obj) => obj
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect(),
+        None => std::collections::HashMap::new(),
+    }
 }
 
 // ─── Preflight ────────────────────────────────────────────────────────────────
