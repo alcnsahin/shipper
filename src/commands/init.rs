@@ -251,11 +251,15 @@ fn prompt_android_inputs(detected: &ProjectDefaults) -> Result<AndroidInputs> {
         }),
     )?;
     let build_type = if build_type_input == "aab" { "bundle".to_string() } else { build_type_input };
-    let keystore_path = prompt(
-        "  Keystore path",
-        detected.keystore_path.as_deref().or(Some("~/.shipper/keys/release.keystore")),
-    )?;
-    let keystore_alias = prompt("  Keystore alias", detected.keystore_alias.as_deref())?;
+
+    // Keystore path and alias: use detected values from build.gradle, or fall back to
+    // shipper's default location. If the keystore doesn't exist at deploy time,
+    // shipper will generate one automatically with keytool.
+    let keystore_path = detected.keystore_path.clone()
+        .unwrap_or_else(|| format!("~/.shipper/keys/{}.keystore", package_name));
+    let keystore_alias = detected.keystore_alias.clone()
+        .unwrap_or_else(|| "release".to_string());
+
     Ok(AndroidInputs { project_dir, package_name, track, build_type, keystore_path, keystore_alias })
 }
 

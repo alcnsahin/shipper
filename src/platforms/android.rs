@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use console::style;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
@@ -15,6 +16,7 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
     let google = config.google_credentials()?;
 
     preflight_checks(android)?;
+    ensure_keystore_setup(android).await?;
 
     println!("{}", style("Android Pipeline").bold().underlined());
     println!();
@@ -91,20 +93,104 @@ fn preflight_checks(android: &AndroidConfig) -> Result<()> {
         );
     }
 
-    // Check keystore
-    let ks_path = crate::config::expand_path(&android.keystore_path);
-    if !ks_path.exists() {
-        anyhow::bail!(
-            "Keystore not found: {}",
-            ks_path.display()
-        );
-    }
-
     // Check apksigner (part of Android Build Tools)
     which::which("apksigner").or_else(|_| which::which("jarsigner"))
         .context("Neither 'apksigner' nor 'jarsigner' found. Install Android SDK.")?;
 
     spinner.finish_and_clear();
+    Ok(())
+}
+
+// ─── Keystore setup ───────────────────────────────────────────────────────────
+
+/// Ensures a release keystore exists before signing. If not found, generates one
+/// with keytool and saves the password to the configured keystore_password_path.
+///
+/// ⚠ The generated keystore must be backed up — losing it means you can never
+/// update the app on Play Store.
+async fn ensure_keystore_setup(android: &AndroidConfig) -> Result<()> {
+    let ks_path = crate::config::expand_path(&android.keystore_path);
+
+    if ks_path.exists() {
+        return Ok(());
+    }
+
+    println!(
+        "  {} Keystore not found at {} — generating a new one...",
+        style("i").dim(),
+        ks_path.display()
+    );
+    println!(
+        "  {} {} Back up this file — losing it means you cannot update the app on Play Store.",
+        style("!").yellow().bold(),
+        style("Important:").bold()
+    );
+    println!();
+
+    // Prompt for password
+    print!("  Keystore password (min 6 chars): ");
+    io::stdout().flush()?;
+    let mut password = String::new();
+    io::stdin().read_line(&mut password)?;
+    let password = password.trim().to_string();
+    if password.len() < 6 {
+        anyhow::bail!("Keystore password must be at least 6 characters");
+    }
+
+    // Create parent directory
+    if let Some(parent) = ks_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let spinner = progress::spinner("Generating keystore with keytool...");
+
+    let status = Command::new("keytool")
+        .args([
+            "-genkeypair",
+            "-v",
+            "-keystore", &ks_path.to_string_lossy(),
+            "-alias", &android.keystore_alias,
+            "-keyalg", "RSA",
+            "-keysize", "2048",
+            "-validity", "10000",
+            "-storepass", &password,
+            "-keypass", &password,
+            "-dname", &format!("CN={}, OU=Android, O=Android, L=Android, ST=Android, C=US", android.package_name),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .status()
+        .await
+        .context("Failed to run keytool — is JDK installed?")?;
+
+    spinner.finish_and_clear();
+
+    if !status.success() {
+        anyhow::bail!("keytool failed to generate keystore");
+    }
+
+    // Save password to the configured password file
+    let pw_path = crate::config::expand_path(&android.keystore_password_path);
+    if let Some(parent) = pw_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&pw_path, &password)?;
+    // Restrict permissions on the password file
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pw_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    println!("  {} Keystore generated: {}", style("✓").green().bold(), ks_path.display());
+    println!("  {} Password saved to: {}", style("✓").green().bold(), pw_path.display());
+    println!(
+        "  {} Back up {} now!",
+        style("!").yellow().bold(),
+        ks_path.display()
+    );
+    println!();
+
     Ok(())
 }
 
