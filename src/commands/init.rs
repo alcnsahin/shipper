@@ -8,20 +8,12 @@ pub async fn run() -> Result<()> {
     println!("{}", style("Initializing shipper").bold());
     println!();
 
-    // Check if shipper.toml already exists
-    if PathBuf::from("shipper.toml").exists() {
-        println!(
-            "  {} shipper.toml already exists in this directory.",
-            style("!").yellow().bold()
-        );
-        print!("  Overwrite? [y/N] ");
-        io::stdout().flush()?;
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        if !input.trim().eq_ignore_ascii_case("y") {
-            println!("  Aborted.");
-            return Ok(());
-        }
+    let toml_path = PathBuf::from("shipper.toml");
+    let existing = ExistingConfig::read(&toml_path);
+
+    // If shipper.toml already exists, only add missing platforms instead of overwriting.
+    if existing.has_ios || existing.has_android {
+        return run_add_platform(&toml_path, existing).await;
     }
 
     let detected = ProjectDefaults::detect();
@@ -48,50 +40,14 @@ pub async fn run() -> Result<()> {
 
     // ── iOS ───────────────────────────────────────────────────────────────────
     let ios_config = if configure_ios {
-        println!();
-        println!("  {}", style("iOS").bold());
-        let workspace = prompt_optional("  Workspace path", detected.ios_workspace.as_deref())?;
-        let scheme = prompt("  Scheme", detected.ios_scheme.as_deref())?;
-        let bundle_id = prompt("  Bundle ID", detected.ios_bundle_id.as_deref())?;
-        let asc_app_id = prompt_optional(
-            "  App Store Connect App ID (leave empty if app doesn't exist yet)",
-            detected.asc_app_id.as_deref(),
-        )?;
-        if asc_app_id.is_none() {
-            println!(
-                "  {} First upload: create the app at appstoreconnect.apple.com → Apps → +",
-                style("i").dim()
-            );
-            println!(
-                "  {} Then add asc_app_id to shipper.toml to enable build status polling.",
-                style("i").dim()
-            );
-        }
-        Some(IosInputs { workspace, scheme, bundle_id, asc_app_id })
+        Some(prompt_ios_inputs(&detected)?)
     } else {
         None
     };
 
     // ── Android ───────────────────────────────────────────────────────────────
     let android_config = if configure_android {
-        println!();
-        println!("  {}", style("Android").bold());
-        let project_dir = prompt("  Project dir", Some("android"))?;
-        let package_name = prompt("  Package name", detected.android_package.as_deref())?;
-        let track = prompt(
-            "  Release track (internal/alpha/beta/production)",
-            detected.android_track.as_deref().or(Some("internal")),
-        )?;
-        let build_type = prompt(
-            "  Build type (bundle=AAB / apk)",
-            detected.android_build_type.as_deref().or(Some("bundle")),
-        )?;
-        let keystore_path = prompt(
-            "  Keystore path",
-            detected.keystore_path.as_deref().or(Some("~/.shipper/keys/release.keystore")),
-        )?;
-        let keystore_alias = prompt("  Keystore alias", detected.keystore_alias.as_deref())?;
-        Some(AndroidInputs { project_dir, package_name, track, build_type, keystore_path, keystore_alias })
+        Some(prompt_android_inputs(&detected)?)
     } else {
         None
     };
@@ -103,7 +59,7 @@ pub async fn run() -> Result<()> {
     };
 
     let content = generate_project_config(&project_name, ios_config.as_ref(), android_config.as_ref());
-    std::fs::write("shipper.toml", &content)?;
+    std::fs::write(&toml_path, &content)?;
     println!();
     println!("  {} Created shipper.toml", style("✓").bold().green());
 
@@ -114,6 +70,192 @@ pub async fn run() -> Result<()> {
         configure_android,
     )?;
 
+    print_next_steps(configure_ios, configure_android, service_account_hint.is_none());
+    Ok(())
+}
+
+/// Called when shipper.toml already exists. Detects which platforms are missing
+/// and appends only the new platform's config without touching existing sections.
+async fn run_add_platform(toml_path: &PathBuf, existing: ExistingConfig) -> Result<()> {
+    let detected = ProjectDefaults::detect();
+
+    let missing_ios = !existing.has_ios;
+    let missing_android = !existing.has_android;
+
+    if !missing_ios && !missing_android {
+        println!(
+            "  {} shipper.toml already has both [ios] and [android] configured.",
+            style("i").dim()
+        );
+        println!("  Nothing to add.");
+        return Ok(());
+    }
+
+    // Tell the user what's already there and what will be added.
+    let already: Vec<&str> = [
+        if existing.has_ios { Some("ios") } else { None },
+        if existing.has_android { Some("android") } else { None },
+    ]
+    .iter()
+    .flatten()
+    .copied()
+    .collect();
+
+    println!(
+        "  {} shipper.toml found — {} already configured.",
+        style("i").dim(),
+        already.join(", ")
+    );
+
+    if detected.is_expo {
+        println!(
+            "  {} Expo project detected — reading app.json, eas.json, build.gradle",
+            style("✓").bold().green()
+        );
+    }
+    println!();
+
+    // Ask which missing platform(s) to add.
+    let add_ios = if missing_ios {
+        print!("  Add [ios] configuration? [Y/n] ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        !input.trim().eq_ignore_ascii_case("n")
+    } else {
+        false
+    };
+
+    let add_android = if missing_android {
+        print!("  Add [android] configuration? [Y/n] ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        !input.trim().eq_ignore_ascii_case("n")
+    } else {
+        false
+    };
+
+    if !add_ios && !add_android {
+        println!("  Nothing added.");
+        return Ok(());
+    }
+
+    // Collect inputs and append to existing shipper.toml.
+    let mut append = String::new();
+
+    let ios_config = if add_ios {
+        println!();
+        println!("  {}", style("iOS").bold());
+        let cfg = prompt_ios_inputs(&detected)?;
+        append.push_str(&generate_ios_section(&cfg));
+        Some(cfg)
+    } else {
+        None
+    };
+
+    let android_config = if add_android {
+        println!();
+        println!("  {}", style("Android").bold());
+        let cfg = prompt_android_inputs(&detected)?;
+        append.push_str(&generate_android_section(&cfg));
+        Some(cfg)
+    } else {
+        None
+    };
+
+    // Append new sections to the existing file.
+    let mut existing_content = std::fs::read_to_string(toml_path)?;
+    if !existing_content.ends_with('\n') {
+        existing_content.push('\n');
+    }
+    existing_content.push_str(&append);
+    std::fs::write(toml_path, &existing_content)?;
+
+    println!();
+    println!("  {} Updated shipper.toml", style("✓").bold().green());
+
+    let service_account_hint = if add_android {
+        detected.google_service_account.clone()
+    } else {
+        None
+    };
+
+    ensure_global_config(
+        if add_ios { &detected.apple_team_id } else { &None },
+        if add_android { service_account_hint.as_deref() } else { None },
+        add_ios,
+        add_android,
+    )?;
+
+    print_next_steps(
+        ios_config.is_some(),
+        android_config.is_some(),
+        service_account_hint.is_none(),
+    );
+    Ok(())
+}
+
+// ─── Existing config detection ───────────────────────────────────────────────
+
+struct ExistingConfig {
+    has_ios: bool,
+    has_android: bool,
+}
+
+impl ExistingConfig {
+    fn read(path: &PathBuf) -> Self {
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        ExistingConfig {
+            has_ios: content.contains("[ios]"),
+            has_android: content.contains("[android]"),
+        }
+    }
+}
+
+// ─── Shared prompt helpers ────────────────────────────────────────────────────
+
+fn prompt_ios_inputs(detected: &ProjectDefaults) -> Result<IosInputs> {
+    let workspace = prompt_optional("  Workspace path", detected.ios_workspace.as_deref())?;
+    let scheme = prompt("  Scheme", detected.ios_scheme.as_deref())?;
+    let bundle_id = prompt("  Bundle ID", detected.ios_bundle_id.as_deref())?;
+    let asc_app_id = prompt_optional(
+        "  App Store Connect App ID (leave empty if app doesn't exist yet)",
+        detected.asc_app_id.as_deref(),
+    )?;
+    if asc_app_id.is_none() {
+        println!(
+            "  {} First upload: create the app at appstoreconnect.apple.com → Apps → +",
+            style("i").dim()
+        );
+        println!(
+            "  {} Then add asc_app_id to shipper.toml to enable build status polling.",
+            style("i").dim()
+        );
+    }
+    Ok(IosInputs { workspace, scheme, bundle_id, asc_app_id })
+}
+
+fn prompt_android_inputs(detected: &ProjectDefaults) -> Result<AndroidInputs> {
+    let project_dir = prompt("  Project dir", Some("android"))?;
+    let package_name = prompt("  Package name", detected.android_package.as_deref())?;
+    let track = prompt(
+        "  Release track (internal/alpha/beta/production)",
+        detected.android_track.as_deref().or(Some("internal")),
+    )?;
+    let build_type = prompt(
+        "  Build type (bundle=AAB / apk)",
+        detected.android_build_type.as_deref().or(Some("bundle")),
+    )?;
+    let keystore_path = prompt(
+        "  Keystore path",
+        detected.keystore_path.as_deref().or(Some("~/.shipper/keys/release.keystore")),
+    )?;
+    let keystore_alias = prompt("  Keystore alias", detected.keystore_alias.as_deref())?;
+    Ok(AndroidInputs { project_dir, package_name, track, build_type, keystore_path, keystore_alias })
+}
+
+fn print_next_steps(configure_ios: bool, configure_android: bool, needs_service_account: bool) {
     println!();
     println!("  {} Next steps:", style("→").bold().cyan());
     println!();
@@ -121,7 +263,7 @@ pub async fn run() -> Result<()> {
     if configure_ios {
         println!("     2. Place .p8 key at ~/.shipper/keys/AuthKey_<KEY_ID>.p8");
     }
-    if configure_android && service_account_hint.is_none() {
+    if configure_android && needs_service_account {
         println!("     3. Place Google service account at ~/.shipper/keys/play-store-sa.json");
     }
     if configure_ios {
@@ -131,8 +273,6 @@ pub async fn run() -> Result<()> {
         println!("     → shipper deploy android");
     }
     println!();
-
-    Ok(())
 }
 
 // ─── Platform selection ───────────────────────────────────────────────────────
@@ -383,24 +523,17 @@ fn prompt_optional(label: &str, default: Option<&str>) -> Result<Option<String>>
 
 // ─── Config generation ────────────────────────────────────────────────────────
 
-fn generate_project_config(
-    name: &str,
-    ios: Option<&IosInputs>,
-    android: Option<&AndroidInputs>,
-) -> String {
-    let mut out = format!("[project]\nname = \"{name}\"\n");
-
-    if let Some(ios) = ios {
-        let workspace_line = match &ios.workspace {
-            Some(ws) => format!("workspace = \"{}\"\n", ws),
-            None => "# workspace = \"ios/MyApp.xcworkspace\"\n".to_string(),
-        };
-        let asc_line = match &ios.asc_app_id {
-            Some(id) => format!("asc_app_id = \"{}\"\n", id),
-            None => "# asc_app_id = \"\"  # Add after creating app in App Store Connect\n".to_string(),
-        };
-        out.push_str(&format!(
-            r#"
+fn generate_ios_section(ios: &IosInputs) -> String {
+    let workspace_line = match &ios.workspace {
+        Some(ws) => format!("workspace = \"{}\"\n", ws),
+        None => "# workspace = \"ios/MyApp.xcworkspace\"\n".to_string(),
+    };
+    let asc_line = match &ios.asc_app_id {
+        Some(id) => format!("asc_app_id = \"{}\"\n", id),
+        None => "# asc_app_id = \"\"  # Add after creating app in App Store Connect\n".to_string(),
+    };
+    format!(
+        r#"
 [ios]
 {workspace_line}scheme = "{scheme}"
 bundle_id = "{bundle_id}"
@@ -409,16 +542,16 @@ bundle_id = "{bundle_id}"
 # code_sign_identity = "Apple Distribution: Company Name (TEAMID)"
 configuration = "Release"
 "#,
-            workspace_line = workspace_line,
-            scheme = ios.scheme,
-            bundle_id = ios.bundle_id,
-            asc_line = asc_line,
-        ));
-    }
+        workspace_line = workspace_line,
+        scheme = ios.scheme,
+        bundle_id = ios.bundle_id,
+        asc_line = asc_line,
+    )
+}
 
-    if let Some(android) = android {
-        out.push_str(&format!(
-            r#"
+fn generate_android_section(android: &AndroidInputs) -> String {
+    format!(
+        r#"
 [android]
 project_dir = "{project_dir}"
 package_name = "{package_name}"
@@ -429,13 +562,27 @@ keystore_password_path = "~/.shipper/keys/keystore-password"
 # key_password_path = "~/.shipper/keys/key-password"
 build_type = "{build_type}"
 "#,
-            project_dir = android.project_dir,
-            package_name = android.package_name,
-            track = android.track,
-            keystore_path = android.keystore_path,
-            keystore_alias = android.keystore_alias,
-            build_type = android.build_type,
-        ));
+        project_dir = android.project_dir,
+        package_name = android.package_name,
+        track = android.track,
+        keystore_path = android.keystore_path,
+        keystore_alias = android.keystore_alias,
+        build_type = android.build_type,
+    )
+}
+
+fn generate_project_config(
+    name: &str,
+    ios: Option<&IosInputs>,
+    android: Option<&AndroidInputs>,
+) -> String {
+    let mut out = format!("[project]\nname = \"{name}\"\n");
+
+    if let Some(ios) = ios {
+        out.push_str(&generate_ios_section(ios));
+    }
+    if let Some(android) = android {
+        out.push_str(&generate_android_section(android));
     }
 
     out.push_str(
