@@ -611,52 +611,70 @@ fn ensure_global_config(
     include_google: bool,
 ) -> Result<()> {
     let config_path = crate::config::global_config_path();
-    if config_path.exists() {
-        return Ok(());
-    }
-
     let config_dir = config_path.parent().unwrap();
     std::fs::create_dir_all(config_dir)?;
     std::fs::create_dir_all(config_dir.join("keys"))?;
 
-    let mut content = "[global]\nnotify = []\nlog_level = \"info\"\n".to_string();
+    if !config_path.exists() {
+        // Create from scratch
+        let mut content = "[global]\nnotify = []\nlog_level = \"info\"\n".to_string();
 
-    if include_apple {
-        let team_id = apple_team_id.as_deref().unwrap_or("YOUR_TEAM_ID");
-        content.push_str(&format!(
-            r#"
+        if include_apple {
+            let team_id = apple_team_id.as_deref().unwrap_or("YOUR_TEAM_ID");
+            content.push_str(&format!(
+                r#"
 [credentials.apple]
 team_id = "{team_id}"
 key_id = "YOUR_KEY_ID"
 issuer_id = "your-issuer-id"
 key_path = "~/.shipper/keys/AuthKey_YOUR_KEY_ID.p8"
 "#
-        ));
-    }
+            ));
+        }
 
-    if include_google {
-        let sa_path = service_account_hint.unwrap_or("~/.shipper/keys/play-store-sa.json");
-        content.push_str(&format!(
-            r#"
+        if include_google {
+            let sa_path = service_account_hint.unwrap_or("~/.shipper/keys/play-store-sa.json");
+            content.push_str(&format!(
+                r#"
 [credentials.google]
 service_account = "{sa_path}"
 "#
-        ));
-    }
+            ));
+        }
 
-    content.push_str(
-        r#"
+        content.push_str(
+            r#"
 # [notifications.telegram]
 # bot_token_path = "~/.shipper/keys/telegram-bot-token"
 # chat_id = "-100xxxxxxxxxx"
 "#,
-    );
+        );
 
-    std::fs::write(&config_path, content)?;
-    println!(
-        "  {} Created ~/.shipper/config.toml",
-        style("✓").bold().green()
-    );
+        std::fs::write(&config_path, &content)?;
+        println!(
+            "  {} Created ~/.shipper/config.toml",
+            style("✓").bold().green()
+        );
+    } else if include_google {
+        // File exists — append [credentials.google] only if not already present
+        let existing = std::fs::read_to_string(&config_path)?;
+        if !existing.contains("[credentials.google]") {
+            let sa_path = service_account_hint.unwrap_or("~/.shipper/keys/play-store-sa.json");
+            let append = format!(
+                r#"
+[credentials.google]
+service_account = "{sa_path}"
+"#
+            );
+            let mut file = std::fs::OpenOptions::new().append(true).open(&config_path)?;
+            use std::io::Write as _;
+            file.write_all(append.as_bytes())?;
+            println!(
+                "  {} Updated ~/.shipper/config.toml (added [credentials.google])",
+                style("✓").bold().green()
+            );
+        }
+    }
 
     Ok(())
 }
