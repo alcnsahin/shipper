@@ -155,7 +155,61 @@ fn preflight_checks(android: &AndroidConfig) -> Result<()> {
         .context("Neither 'apksigner' nor 'jarsigner' found. Install Android SDK.")?;
 
     spinner.finish_and_clear();
+
+    // Ensure local.properties has sdk.dir so Gradle can find the Android SDK.
+    ensure_local_properties(project_dir)?;
+
     Ok(())
+}
+
+/// Writes android/local.properties with sdk.dir if it is missing or incomplete.
+/// Resolution order:
+///   1. $ANDROID_HOME env var
+///   2. $ANDROID_SDK_ROOT env var
+///   3. ~/Library/Android/sdk  (macOS Android Studio default)
+///   4. ~/Android/Sdk          (Linux Android Studio default)
+fn ensure_local_properties(project_dir: &Path) -> Result<()> {
+    let props_path = project_dir.join("local.properties");
+
+    // If the file already has sdk.dir, nothing to do.
+    if let Ok(content) = std::fs::read_to_string(&props_path) {
+        if content.lines().any(|l| l.trim_start().starts_with("sdk.dir")) {
+            return Ok(());
+        }
+    }
+
+    let sdk_path = std::env::var("ANDROID_HOME")
+        .ok()
+        .or_else(|| std::env::var("ANDROID_SDK_ROOT").ok())
+        .map(PathBuf::from)
+        .or_else(|| {
+            dirs::home_dir().and_then(|h| {
+                let candidates = [
+                    h.join("Library/Android/sdk"),   // macOS
+                    h.join("Android/Sdk"),            // Linux
+                ];
+                candidates.into_iter().find(|p| p.exists())
+            })
+        });
+
+    match sdk_path {
+        Some(path) => {
+            // Append or create local.properties
+            let line = format!("sdk.dir={}\n", path.to_string_lossy().replace('\\', "\\\\"));
+            let existing = std::fs::read_to_string(&props_path).unwrap_or_default();
+            std::fs::write(&props_path, format!("{}{}", existing, line))?;
+            println!(
+                "  {} Android SDK: {} (written to local.properties)",
+                style("i").dim(),
+                path.display()
+            );
+            Ok(())
+        }
+        None => anyhow::bail!(
+            "Android SDK not found. Set ANDROID_HOME or install Android Studio.\n\
+             Then re-run: shipper deploy android"
+        ),
+    }
 }
 
 // ─── Keystore setup ───────────────────────────────────────────────────────────
