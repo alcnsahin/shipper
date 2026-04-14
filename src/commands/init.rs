@@ -243,10 +243,14 @@ fn prompt_android_inputs(detected: &ProjectDefaults) -> Result<AndroidInputs> {
         "  Release track (internal/alpha/beta/production)",
         detected.android_track.as_deref().or(Some("internal")),
     )?;
-    let build_type = prompt(
-        "  Build type (bundle=AAB / apk)",
-        detected.android_build_type.as_deref().or(Some("bundle")),
+    let build_type_input = prompt(
+        "  Build type (aab / apk)",
+        Some(match detected.android_build_type.as_deref() {
+            Some("bundle") | None => "aab",
+            Some(other) => other,
+        }),
     )?;
+    let build_type = if build_type_input == "aab" { "bundle".to_string() } else { build_type_input };
     let keystore_path = prompt(
         "  Keystore path",
         detected.keystore_path.as_deref().or(Some("~/.shipper/keys/release.keystore")),
