@@ -52,6 +52,7 @@ Shipper is a single self-contained binary. Install it with Homebrew and deploy i
 ### macOS (Homebrew) — recommended
 
 ```bash
+brew tap alcnsahin/tap
 brew update && brew upgrade shipper
 ```
 
