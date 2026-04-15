@@ -545,7 +545,7 @@ fn generate_ios_section(ios: &IosInputs) -> String {
 [ios]
 {workspace_line}scheme = "{scheme}"
 bundle_id = "{bundle_id}"
-{asc_line}export_method = "app-store"
+{asc_line}export_method = "app-store-connect"
 # provisioning_profile = "MyApp AppStore"
 # code_sign_identity = "Apple Distribution: Company Name (TEAMID)"
 configuration = "Release"

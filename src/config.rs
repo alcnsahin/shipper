@@ -97,7 +97,7 @@ pub struct IosConfig {
 }
 
 fn default_export_method() -> String {
-    "app-store".to_string()
+    "app-store-connect".to_string()
 }
 
 fn default_configuration() -> String {

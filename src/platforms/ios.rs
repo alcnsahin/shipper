@@ -797,29 +797,30 @@ async fn archive(
     spinner.finish_and_clear();
 
     if !output.status.success() {
-        // xcodebuild writes build logs to stdout and errors to stderr.
-        // Combine both and extract lines containing "error:" for a clean message.
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let combined = format!("{}\n{}", stdout, stderr);
 
+        // Collect lines that indicate errors or failures.
         let errors: Vec<&str> = combined
             .lines()
             .filter(|l| {
-                let l = l.trim();
-                l.contains("error:") && !l.starts_with("//")
+                let t = l.trim();
+                (t.contains("error:") || t.contains("fatal:") || t.starts_with("**"))
+                    && !t.starts_with("//")
+                    && !t.is_empty()
             })
-            .take(15)
+            .take(20)
             .collect();
 
-        if errors.is_empty() {
-            // Fall back to last 20 lines of stdout which usually has the summary
-            let last_lines: Vec<&str> = stdout.lines().rev().take(20).collect::<Vec<_>>()
-                .into_iter().rev().collect();
-            anyhow::bail!("xcodebuild archive failed:\n{}", last_lines.join("\n"));
-        } else {
+        if !errors.is_empty() {
             anyhow::bail!("xcodebuild archive failed:\n{}", errors.join("\n"));
         }
+
+        // Fall back: last 40 lines of combined output (xcodebuild summary is at the end).
+        let last_lines: Vec<&str> = combined.lines().rev().take(40).collect::<Vec<_>>()
+            .into_iter().rev().collect();
+        anyhow::bail!("xcodebuild archive failed:\n{}", last_lines.join("\n"));
     }
 
     Ok(archive_path)
