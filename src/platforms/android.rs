@@ -253,15 +253,39 @@ async fn ensure_keystore_setup(android: &AndroidConfig) -> Result<()> {
     }
 
     println!(
-        "  {} Keystore not found at {} — generating a new one...",
-        style("i").dim(),
+        "  {} Keystore not found at {}",
+        style("!").yellow().bold(),
         ks_path.display()
     );
+    println!();
     println!(
-        "  {} {} Back up this file — losing it means you cannot update the app on Play Store.",
-        style("!").yellow().bold(),
-        style("Important:").bold()
+        "  {} {}",
+        style("WARNING:").red().bold(),
+        style("Generating a NEW keystore will produce a different signing fingerprint.").bold()
     );
+    println!(
+        "  {}",
+        style("If your app is already published on Play Store, uploading a build signed").dim()
+    );
+    println!(
+        "  {}",
+        style("with a new keystore will be REJECTED.").dim()
+    );
+    println!();
+    print!("  Continue and generate a new keystore? [y/N] ");
+    io::stdout().flush()?;
+    let mut confirm = String::new();
+    io::stdin().read_line(&mut confirm)?;
+    match confirm.trim().to_lowercase().as_str() {
+        "y" | "yes" => {}
+        _ => {
+            anyhow::bail!(
+                "Keystore generation cancelled. \
+                Place the correct keystore at {} and re-run.",
+                ks_path.display()
+            );
+        }
+    }
     println!();
 
     // Prompt for password

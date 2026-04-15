@@ -47,7 +47,7 @@ pub async fn run() -> Result<()> {
 
     // ── Android ───────────────────────────────────────────────────────────────
     let android_config = if configure_android {
-        Some(prompt_android_inputs(&detected)?)
+        Some(prompt_android_inputs(&detected, &project_name)?)
     } else {
         None
     };
@@ -68,9 +68,10 @@ pub async fn run() -> Result<()> {
         if configure_android { service_account_hint.as_deref() } else { None },
         configure_ios,
         configure_android,
+        &project_name,
     )?;
 
-    print_next_steps(configure_ios, configure_android, service_account_hint.is_none());
+    print_next_steps(configure_ios, configure_android, service_account_hint.is_none(), &project_name);
     Ok(())
 }
 
@@ -144,6 +145,11 @@ async fn run_add_platform(toml_path: &PathBuf, existing: ExistingConfig) -> Resu
     // Collect inputs and append to existing shipper.toml.
     let mut append = String::new();
 
+    let project_name = existing
+        .project_name
+        .clone()
+        .unwrap_or_else(|| detect_dir_name().unwrap_or_else(|| "app".to_string()));
+
     let ios_config = if add_ios {
         println!();
         println!("  {}", style("iOS").bold());
@@ -157,7 +163,7 @@ async fn run_add_platform(toml_path: &PathBuf, existing: ExistingConfig) -> Resu
     let android_config = if add_android {
         println!();
         println!("  {}", style("Android").bold());
-        let cfg = prompt_android_inputs(&detected)?;
+        let cfg = prompt_android_inputs(&detected, &project_name)?;
         append.push_str(&generate_android_section(&cfg));
         Some(cfg)
     } else {
@@ -186,12 +192,14 @@ async fn run_add_platform(toml_path: &PathBuf, existing: ExistingConfig) -> Resu
         if add_android { service_account_hint.as_deref() } else { None },
         add_ios,
         add_android,
+        &project_name,
     )?;
 
     print_next_steps(
         ios_config.is_some(),
         android_config.is_some(),
         service_account_hint.is_none(),
+        &project_name,
     );
     Ok(())
 }
@@ -201,14 +209,23 @@ async fn run_add_platform(toml_path: &PathBuf, existing: ExistingConfig) -> Resu
 struct ExistingConfig {
     has_ios: bool,
     has_android: bool,
+    project_name: Option<String>,
 }
 
 impl ExistingConfig {
     fn read(path: &PathBuf) -> Self {
         let content = std::fs::read_to_string(path).unwrap_or_default();
+        let project_name = Regex::new(r#"^\s*name\s*=\s*"([^"]+)""#)
+            .ok()
+            .and_then(|re| {
+                content
+                    .lines()
+                    .find_map(|line| re.captures(line).and_then(|c| c.get(1)).map(|m| m.as_str().to_string()))
+            });
         ExistingConfig {
             has_ios: content.contains("[ios]"),
             has_android: content.contains("[android]"),
+            project_name,
         }
     }
 }
@@ -236,7 +253,7 @@ fn prompt_ios_inputs(detected: &ProjectDefaults) -> Result<IosInputs> {
     Ok(IosInputs { workspace, scheme, bundle_id, asc_app_id })
 }
 
-fn prompt_android_inputs(detected: &ProjectDefaults) -> Result<AndroidInputs> {
+fn prompt_android_inputs(detected: &ProjectDefaults, project_name: &str) -> Result<AndroidInputs> {
     let project_dir = prompt("  Project dir", Some("android"))?;
     let package_name = prompt("  Package name", detected.android_package.as_deref())?;
     let track = prompt(
@@ -252,27 +269,48 @@ fn prompt_android_inputs(detected: &ProjectDefaults) -> Result<AndroidInputs> {
     )?;
     let build_type = if build_type_input == "aab" { "bundle".to_string() } else { build_type_input };
 
-    // Keystore path and alias: use detected values from build.gradle, or fall back to
-    // shipper's default location. If the keystore doesn't exist at deploy time,
-    // shipper will generate one automatically with keytool.
+    // Project-scoped paths: ~/.shipper/{project_name}/android/keys/
+    let android_keys_base = format!("~/.shipper/{}/android/keys", project_name);
     let keystore_path = detected.keystore_path.clone()
-        .unwrap_or_else(|| format!("~/.shipper/keys/{}.keystore", package_name));
+        .unwrap_or_else(|| format!("{}/release.keystore", android_keys_base));
     let keystore_alias = detected.keystore_alias.clone()
         .unwrap_or_else(|| "release".to_string());
+    let keystore_password_path = format!("{}/keystore-password", android_keys_base);
 
-    Ok(AndroidInputs { project_dir, package_name, track, build_type, keystore_path, keystore_alias })
+    Ok(AndroidInputs {
+        project_dir,
+        package_name,
+        track,
+        build_type,
+        keystore_path,
+        keystore_alias,
+        keystore_password_path,
+    })
 }
 
-fn print_next_steps(configure_ios: bool, configure_android: bool, needs_service_account: bool) {
+fn print_next_steps(
+    configure_ios: bool,
+    configure_android: bool,
+    needs_service_account: bool,
+    project_name: &str,
+) {
     println!();
     println!("  {} Next steps:", style("→").bold().cyan());
     println!();
     println!("     1. Fill in credentials in ~/.shipper/config.toml");
     if configure_ios {
-        println!("     2. Place .p8 key at ~/.shipper/keys/AuthKey_<KEY_ID>.p8");
+        println!("     2. Place .p8 key at ~/.shipper/keys/AuthKey_<KEY_ID>.p8  (shared)");
+        println!(
+            "        iOS signing credentials → ~/.shipper/{}/ios/keys/",
+            project_name
+        );
     }
     if configure_android && needs_service_account {
-        println!("     3. Place Google service account at ~/.shipper/keys/play-store-sa.json");
+        println!("     3. Place Google service account at ~/.shipper/keys/play-store-sa.json  (shared)");
+        println!(
+            "        Android keystore → ~/.shipper/{}/android/keys/",
+            project_name
+        );
     }
     if configure_ios {
         println!("     → shipper deploy ios");
@@ -328,6 +366,7 @@ struct AndroidInputs {
     build_type: String,
     keystore_path: String,
     keystore_alias: String,
+    keystore_password_path: String,
 }
 
 // ─── Detection ────────────────────────────────────────────────────────────────
@@ -451,8 +490,11 @@ fn find_eas_android_build_type(eas: &serde_json::Value) -> Option<String> {
 
 fn read_gradle_signing() -> Option<(String, Option<String>)> {
     let content = std::fs::read_to_string("android/app/build.gradle").ok()?;
-    let alias_re = Regex::new(r#"keyAlias\s+["']?([^"'\s\n]+)["']?"#).unwrap();
+
+    // Only match a quoted string literal — ignore dynamic lookups like project.findProperty(...)
+    let alias_re = Regex::new(r#"keyAlias\s+["']([^"']+)["']"#).unwrap();
     let store_re = Regex::new(r#"storeFile\s+file\(["']([^"']+)["']\)"#).unwrap();
+
     let alias = alias_re
         .captures(&content)
         .and_then(|c| c.get(1))
@@ -558,6 +600,12 @@ configuration = "Release"
 }
 
 fn generate_android_section(android: &AndroidInputs) -> String {
+    // Derive the key_password_path from the same directory as keystore_password_path
+    let key_password_path = android.keystore_password_path
+        .rsplit_once('/')
+        .map(|(dir, _)| format!("{}/key-password", dir))
+        .unwrap_or_else(|| "~/.shipper/keys/key-password".to_string());
+
     format!(
         r#"
 [android]
@@ -566,8 +614,8 @@ package_name = "{package_name}"
 track = "{track}"
 keystore_path = "{keystore_path}"
 keystore_alias = "{keystore_alias}"
-keystore_password_path = "~/.shipper/keys/keystore-password"
-# key_password_path = "~/.shipper/keys/key-password"
+keystore_password_path = "{keystore_password_path}"
+# key_password_path = "{key_password_path}"
 build_type = "{build_type}"
 "#,
         project_dir = android.project_dir,
@@ -575,6 +623,8 @@ build_type = "{build_type}"
         track = android.track,
         keystore_path = android.keystore_path,
         keystore_alias = android.keystore_alias,
+        keystore_password_path = android.keystore_password_path,
+        key_password_path = key_password_path,
         build_type = android.build_type,
     )
 }
@@ -609,11 +659,17 @@ fn ensure_global_config(
     service_account_hint: Option<&str>,
     include_apple: bool,
     include_google: bool,
+    project_name: &str,
 ) -> Result<()> {
     let config_path = crate::config::global_config_path();
     let config_dir = config_path.parent().unwrap();
-    std::fs::create_dir_all(config_dir)?;
+
+    // Shared keys directory (Apple .p8, Google service account)
     std::fs::create_dir_all(config_dir.join("keys"))?;
+
+    // Project-scoped directories
+    std::fs::create_dir_all(config_dir.join(project_name).join("android").join("keys"))?;
+    std::fs::create_dir_all(config_dir.join(project_name).join("ios").join("keys"))?;
 
     if !config_path.exists() {
         // Create from scratch

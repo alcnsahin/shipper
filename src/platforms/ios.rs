@@ -89,8 +89,9 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
     }
 
     // Ensure signing credentials are installed (cert in Keychain, profile on disk).
-    // Looks in ~/.shipper/keys/<bundle_id>/ then ./credentials/ios/ — installs automatically.
-    ensure_signing_setup(ios).await?;
+    // Looks in ~/.shipper/<project_name>/ios/keys/ then ./credentials/ios/ — installs automatically.
+    let project_name = &config.project.project.name;
+    ensure_signing_setup(ios, project_name).await?;
 
     // Resolve signing config — use shipper.toml values, auto-detect, or prompt
     let (signing_profile, signing_identity) = resolve_signing_config(ios).await?;
@@ -410,7 +411,7 @@ fn collect_shared_schemes() -> Vec<String> {
 ///   2. ./credentials/ios/   (EAS download location)
 /// If still missing, runs `eas credentials --platform ios` automatically to
 /// download them, then copies to ~/.shipper/keys/<bundle_id>/ and installs.
-async fn ensure_signing_setup(ios: &IosConfig) -> Result<()> {
+async fn ensure_signing_setup(ios: &IosConfig, project_name: &str) -> Result<()> {
     let has_cert = detect_code_sign_identity().await.is_some();
     let has_profile = detect_provisioning_profile(&ios.bundle_id).is_some();
 
@@ -418,10 +419,13 @@ async fn ensure_signing_setup(ios: &IosConfig) -> Result<()> {
         return Ok(());
     }
 
+    // Project-scoped: ~/.shipper/{project_name}/ios/keys/
     let shipper_dir = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("~"))
-        .join(".shipper/keys")
-        .join(&ios.bundle_id);
+        .join(".shipper")
+        .join(project_name)
+        .join("ios")
+        .join("keys");
 
     let search_dirs: &[PathBuf] = &[
         shipper_dir.clone(),

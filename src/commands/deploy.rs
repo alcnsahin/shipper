@@ -3,11 +3,22 @@ use console::style;
 
 use crate::config::Config;
 use crate::platforms::{android, ios};
+use crate::utils::credentials::migrate_stray_credentials;
 use crate::utils::notifier::{notify, DeployResult};
 use crate::DeployTarget;
 
 pub async fn run(target: DeployTarget) -> Result<()> {
     let config = Config::load()?;
+
+    // Move any stray *.keystore / credentials.json files from the project root
+    // into ~/.shipper/keys/{project_name}/ before the build starts.
+    // Pass the configured keystore_path so migration can update shipper.toml if needed.
+    let android_ks_path = config
+        .project
+        .android
+        .as_ref()
+        .map(|a| a.keystore_path.as_str());
+    migrate_stray_credentials(&config.project.project.name, android_ks_path)?;
 
     match target {
         DeployTarget::Ios => deploy_ios(&config).await,
