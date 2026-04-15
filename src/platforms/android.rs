@@ -31,6 +31,9 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
             )
             .await?;
             progress::success(&format!("Uploaded (versionCode: {})", version_code));
+            // Remove the artifact so it cannot be accidentally reused with the
+            // same versionCode on the next deploy.
+            std::fs::remove_file(&existing).ok();
             progress::step(6, TOTAL_STEPS, "Complete");
             progress::success(&format!(
                 "{} v{} ({}) → {} track",
@@ -382,7 +385,7 @@ fn prompt_reuse_artifact(path: &Path) -> Result<bool> {
 
 fn read_current_version(android: &AndroidConfig) -> Result<AppVersion> {
     if version::is_expo_project() {
-        return version::read_expo_version(Path::new("app.json"));
+        return version::read_expo_version_android(Path::new("app.json"));
     }
     let gradle_path = Path::new(&android.project_dir)
         .join("app")
@@ -402,7 +405,7 @@ fn bump_version(config: &Config, android: &AndroidConfig) -> Result<AppVersion> 
 
     if version::is_expo_project() {
         let app_json = Path::new("app.json");
-        let mut v = version::read_expo_version(app_json)?;
+        let mut v = version::read_expo_version_android(app_json)?;
         if auto_increment {
             v.bump_build();
         }

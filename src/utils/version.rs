@@ -28,6 +28,7 @@ impl AppVersion {
 
 // ─── Expo (app.json) ──────────────────────────────────────────────────────────
 
+/// Reads the iOS build number from app.json (expo.ios.buildNumber).
 pub fn read_expo_version(app_json_path: &Path) -> Result<AppVersion> {
     let content = std::fs::read_to_string(app_json_path)
         .with_context(|| format!("Failed to read {}", app_json_path.display()))?;
@@ -39,16 +40,33 @@ pub fn read_expo_version(app_json_path: &Path) -> Result<AppVersion> {
         .unwrap_or("1.0.0")
         .to_string();
 
-    // iOS build number
     let ios_build = json["expo"]["ios"]["buildNumber"]
         .as_str()
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(1);
 
-    Ok(AppVersion {
-        version_name,
-        build_number: ios_build,
-    })
+    Ok(AppVersion { version_name, build_number: ios_build })
+}
+
+/// Reads the Android version code from app.json (expo.android.versionCode).
+pub fn read_expo_version_android(app_json_path: &Path) -> Result<AppVersion> {
+    let content = std::fs::read_to_string(app_json_path)
+        .with_context(|| format!("Failed to read {}", app_json_path.display()))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&content).context("Failed to parse app.json")?;
+
+    let version_name = json["expo"]["version"]
+        .as_str()
+        .unwrap_or("1.0.0")
+        .to_string();
+
+    // versionCode is stored as an integer in app.json
+    let version_code = json["expo"]["android"]["versionCode"]
+        .as_u64()
+        .map(|v| v as u32)
+        .unwrap_or(1);
+
+    Ok(AppVersion { version_name, build_number: version_code })
 }
 
 pub fn write_expo_version_ios(app_json_path: &Path, version: &AppVersion) -> Result<()> {
