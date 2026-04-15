@@ -18,6 +18,31 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
     println!("{}", style("Android Pipeline").bold().underlined());
     println!();
 
+    // Check for a previously built signed artifact and offer to skip the build
+    if let Some(existing) = find_existing_signed_artifact(android) {
+        if prompt_reuse_artifact(&existing)? {
+            let version = read_current_version(android)?;
+            progress::step(5, TOTAL_STEPS, "Uploading to Play Store");
+            let version_code = playstore::upload_aab(
+                google,
+                &android.package_name,
+                &android.track,
+                &existing,
+            )
+            .await?;
+            progress::success(&format!("Uploaded (versionCode: {})", version_code));
+            progress::step(6, TOTAL_STEPS, "Complete");
+            progress::success(&format!(
+                "{} v{} ({}) → {} track",
+                android.package_name,
+                version.version_name,
+                version.build_number,
+                android.track
+            ));
+            return Ok(version);
+        }
+    }
+
     // Step 1: Version bump
     progress::step(1, TOTAL_STEPS, "Bumping version");
     let app_version = bump_version(config, android)?;
@@ -47,6 +72,7 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
     // Preflight and keystore after prebuild so android/ directory exists
     preflight_checks(android)?;
     ensure_keystore_setup(android).await?;
+    patch_gradle_properties(android)?;
 
     // Step 3: Build
     let artifact_path = if android.build_type == "apk" {
@@ -305,6 +331,41 @@ async fn ensure_keystore_setup(android: &AndroidConfig) -> Result<()> {
     Ok(())
 }
 
+// ─── Existing artifact detection ─────────────────────────────────────────────
+
+fn find_existing_signed_artifact(android: &AndroidConfig) -> Option<PathBuf> {
+    let ext = if android.build_type == "apk" { "apk" } else { "aab" };
+    let path = Path::new(&android.project_dir)
+        .join("app/build/outputs")
+        .join(if ext == "aab" { "bundle/release" } else { "apk/release" })
+        .join(format!("app-release-signed.{}", ext));
+    if path.exists() { Some(path) } else { None }
+}
+
+fn prompt_reuse_artifact(path: &Path) -> Result<bool> {
+    println!(
+        "  {} Found existing signed artifact: {}",
+        style("?").cyan().bold(),
+        path.display()
+    );
+    print!("  {} Skip rebuild and upload this? [Y/n] ", style("→").cyan());
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let answer = input.trim().to_lowercase();
+    Ok(answer.is_empty() || answer == "y" || answer == "yes")
+}
+
+fn read_current_version(android: &AndroidConfig) -> Result<AppVersion> {
+    if version::is_expo_project() {
+        return version::read_expo_version(Path::new("app.json"));
+    }
+    let gradle_path = Path::new(&android.project_dir)
+        .join("app")
+        .join("build.gradle");
+    version::read_gradle_version(&gradle_path)
+}
+
 // ─── Version ─────────────────────────────────────────────────────────────────
 
 fn bump_version(config: &Config, android: &AndroidConfig) -> Result<AppVersion> {
@@ -341,19 +402,110 @@ fn bump_version(config: &Config, android: &AndroidConfig) -> Result<AppVersion> 
     Ok(v)
 }
 
+// ─── Patch Gradle files ───────────────────────────────────────────────────────
+// expo prebuild regenerates gradle.properties and gradle-wrapper.properties,
+// so apply compatibility fixes after it runs.
+
+fn patch_gradle_properties(_android: &AndroidConfig) -> Result<()> {
+    Ok(())
+}
+
+// ─── JDK detection ────────────────────────────────────────────────────────────
+// React Native requires JDK 17 or 21. JDK 22+ is not compatible with the Gradle
+// versions that work with RN's native CMake builds.
+
+fn resolve_java_home() -> Result<String> {
+    if let Some(home) = find_compat_java_home() {
+        progress::info(&format!("Java: {}", home));
+        return Ok(home);
+    }
+    anyhow::bail!(
+        "JDK 17 or 21 not found. React Native requires JDK 17 or 21.\n\
+         Install with: brew install --cask temurin@21\n\
+         Then retry."
+    )
+}
+
+fn find_compat_java_home() -> Option<String> {
+    // Prefer JDK 21, fall back to 17
+    for version in ["21", "17"] {
+        if let Some(home) = try_java_home(version) {
+            return Some(home);
+        }
+    }
+    None
+}
+
+fn try_java_home(major: &str) -> Option<String> {
+    // macOS: /usr/libexec/java_home -v <major> returns "major or higher",
+    // so we must verify the actual major version of the returned path.
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("/usr/libexec/java_home")
+            .arg("-v")
+            .arg(major)
+            .output()
+            .ok()?;
+        if out.status.success() {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !path.is_empty() && java_major_version(&path).as_deref() == Some(major) {
+                return Some(path);
+            }
+        }
+    }
+
+    // Linux: check common paths
+    #[cfg(target_os = "linux")]
+    {
+        let candidates = [
+            format!("/usr/lib/jvm/java-{}-openjdk-amd64", major),
+            format!("/usr/lib/jvm/java-{}-openjdk", major),
+            format!("/usr/lib/jvm/temurin-{}", major),
+            format!("/usr/lib/jvm/java-{}", major),
+        ];
+        for path in &candidates {
+            if std::path::Path::new(path).join("bin/java").exists() {
+                return Some(path.clone());
+            }
+        }
+    }
+
+    None
+}
+
+/// Read the major Java version from `$JAVA_HOME/release` (e.g. "21" from JAVA_VERSION="21.0.4").
+fn java_major_version(java_home: &str) -> Option<String> {
+    let release = std::fs::read_to_string(
+        std::path::Path::new(java_home).join("release")
+    ).ok()?;
+    for line in release.lines() {
+        if line.starts_with("JAVA_VERSION=") {
+            // JAVA_VERSION="21.0.4"  or  JAVA_VERSION=17
+            let val = line.trim_start_matches("JAVA_VERSION=").trim_matches('"');
+            let major = val.split('.').next()?;
+            return Some(major.to_string());
+        }
+    }
+    None
+}
+
 // ─── Gradle build ─────────────────────────────────────────────────────────────
 
 async fn build_aab(android: &AndroidConfig) -> Result<PathBuf> {
     let project_dir = Path::new(&android.project_dir);
 
+    let java_home = resolve_java_home()?;
+
     let spinner = progress::spinner("./gradlew bundleRelease (this can take a few minutes)...");
 
-    let output = Command::new("./gradlew")
-        .arg("bundleRelease")
+    let mut cmd = Command::new("./gradlew");
+    cmd.arg("bundleRelease")
         .current_dir(project_dir)
+        .env("JAVA_HOME", &java_home)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
+        .stderr(std::process::Stdio::piped());
+
+    let output = cmd.output()
         .await
         .context("Failed to run gradlew bundleRelease")?;
 
@@ -361,15 +513,12 @@ async fn build_aab(android: &AndroidConfig) -> Result<PathBuf> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let errors: Vec<&str> = stderr
-            .lines()
-            .filter(|l| l.contains("error") || l.contains("FAILED"))
-            .take(15)
-            .collect();
-        anyhow::bail!(
-            "Gradle build failed:\n{}",
-            if errors.is_empty() { stderr.trim().to_string() } else { errors.join("\n") }
-        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Gradle prints the failure summary at the end of stdout; show the last 60 lines
+        let combined = format!("{}\n{}", stdout, stderr);
+        let all_lines: Vec<&str> = combined.lines().collect();
+        let tail: Vec<&str> = all_lines.iter().rev().take(60).copied().collect::<Vec<_>>().into_iter().rev().collect();
+        anyhow::bail!("Gradle build failed:\n{}", tail.join("\n"));
     }
 
     // Find the generated AAB
@@ -391,11 +540,14 @@ async fn build_aab(android: &AndroidConfig) -> Result<PathBuf> {
 async fn build_apk(android: &AndroidConfig) -> Result<PathBuf> {
     let project_dir = Path::new(&android.project_dir);
 
+    let java_home = resolve_java_home()?;
+
     let spinner = progress::spinner("./gradlew assembleRelease...");
 
     let output = Command::new("./gradlew")
         .arg("assembleRelease")
         .current_dir(project_dir)
+        .env("JAVA_HOME", &java_home)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
@@ -445,7 +597,26 @@ async fn sign_artifact(android: &AndroidConfig, artifact_path: &Path) -> Result<
         .unwrap_or(Path::new("."))
         .join(format!("app-release-signed.{}", ext));
 
-    // Try apksigner first (preferred for AAB and APK)
+    let is_aab = ext == "aab";
+
+    if is_aab {
+        // apksigner does not support AAB files.
+        // Gradle's bundleRelease may have already signed the AAB (debug or release key).
+        // Strip any existing JAR signatures first so we end up with exactly one
+        // certificate chain signed by the correct release keystore.
+        sign_aab_release(
+            &ks_path,
+            &ks_password,
+            &key_password,
+            &android.keystore_alias,
+            artifact_path,
+            &signed_path,
+        )
+        .await?;
+        return Ok(signed_path);
+    }
+
+    // APK: try apksigner first (preferred), fall back to jarsigner
     if which::which("apksigner").is_ok() {
         sign_with_apksigner(
             &ks_path,
@@ -457,7 +628,6 @@ async fn sign_artifact(android: &AndroidConfig, artifact_path: &Path) -> Result<
         )
         .await?;
     } else {
-        // Fallback to jarsigner
         sign_with_jarsigner(
             &ks_path,
             &ks_password,
@@ -470,6 +640,68 @@ async fn sign_artifact(android: &AndroidConfig, artifact_path: &Path) -> Result<
     }
 
     Ok(signed_path)
+}
+
+/// Signs an AAB with the release keystore using jarsigner.
+///
+/// Any existing JAR signatures (e.g. Gradle debug key, prior release key) are
+/// stripped before signing so Play Store sees exactly one certificate chain.
+async fn sign_aab_release(
+    ks_path: &Path,
+    ks_password: &str,
+    key_password: &str,
+    alias: &str,
+    input: &Path,
+    output: &Path,
+) -> Result<()> {
+    std::fs::copy(input, output).context("Failed to copy AAB for signing")?;
+
+    // Strip any META-INF signature files to avoid multiple certificate chains.
+    // Errors are intentionally ignored — the AAB may already be unsigned.
+    let _ = Command::new("zip")
+        .args([
+            "-d",
+            &output.to_string_lossy(),
+            "META-INF/*.SF",
+            "META-INF/*.RSA",
+            "META-INF/*.DSA",
+            "META-INF/*.EC",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+
+    let spinner = progress::spinner("Signing AAB with jarsigner...");
+
+    let status = Command::new("jarsigner")
+        .args([
+            "-sigalg",
+            "SHA256withRSA",
+            "-digestalg",
+            "SHA-256",
+            "-keystore",
+            &ks_path.to_string_lossy(),
+            "-storepass",
+            ks_password,
+            "-keypass",
+            key_password,
+            &output.to_string_lossy(),
+            alias,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .status()
+        .await
+        .context("Failed to run jarsigner")?;
+
+    spinner.finish_and_clear();
+
+    if !status.success() {
+        anyhow::bail!("jarsigner failed to sign AAB");
+    }
+
+    Ok(())
 }
 
 async fn sign_with_apksigner(

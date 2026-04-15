@@ -138,6 +138,12 @@ chmod 600 ~/.shipper/keys/release.keystore
 
 **If you need to create one:**
 
+Shipper auto-generates a keystore on first deploy if the configured path doesn't exist.
+You will be prompted for a password; the keystore is created with RSA 2048 / 10000-day validity
+and the password is saved to `keystore_password_path` (chmod 600).
+
+To generate manually instead:
+
 ```bash
 keytool -genkey -v \
   -keystore ~/.shipper/keys/release.keystore \

@@ -239,12 +239,14 @@ shipper deploy android
 ├─ 1. Bump versionCode        app.json or build.gradle
 ├─ 2. expo prebuild           (Expo / React Native projects only)
 ├─ 3. ./gradlew bundleRelease → app-release.aab
-├─ 4. apksigner               → signed .aab
+├─ 4. Sign                    strip existing sigs + jarsigner (AAB) / apksigner (APK)
 ├─ 5. Play Store API v3       → upload + assign track + commit
 └─ 6. Notify
 ```
 
-**Prerequisites:** Android SDK (`apksigner` in PATH), Java
+**Prerequisites:** Android SDK, JDK (jarsigner), Java
+
+> **Keystore:** If no keystore exists at the configured path, Shipper auto-generates one with `keytool`. Back it up — losing it means you can never update the app on Play Store.
 
 ---
 

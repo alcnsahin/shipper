@@ -23,7 +23,7 @@
 │   │      │ 0. signing setup│        │ 1. version bump    │   │  │
 │   │      │ 1. version bump │        │ 2. expo prebuild   │   │  │
 │   │      │ 2. expo prebuild│        │ 3. gradle build    │   │  │
-│   │      │ 3. pod install  │        │ 4. apksigner       │   │  │
+│   │      │ 3. pod install  │        │ 4. sign artifact   │   │  │
 │   │      │ 4. xcodebuild   │        │ 5. play store API  │   │  │
 │   │      │ 5. export IPA   │        │                    │   │  │
 │   │      │ 6. altool upload│        │                    │   │  │
@@ -143,7 +143,8 @@ shipper deploy ios
 shipper deploy android
 │
 ├─ 1. Preflight checks
-│      gradlew exists, keystore exists, apksigner/jarsigner in PATH
+│      gradlew exists, jarsigner/apksigner in PATH
+│      sdk.dir auto-written to local.properties if missing (ANDROID_HOME / Android Studio defaults)
 │
 ├─ 2. Version bump
 │      Expo:   app.json → expo.android.versionCode += 1
@@ -152,13 +153,19 @@ shipper deploy android
 ├─ 3. Expo prebuild  (if Expo project)
 │      npx expo prebuild --platform android --clean
 │
+├─ 3b. Keystore setup
+│      If keystore not found: auto-generated with keytool (RSA 2048, 10000-day validity)
+│      Password saved to keystore_password_path (chmod 600)
+│
 ├─ 4. Gradle build
 │      ./gradlew bundleRelease  → app/build/outputs/bundle/release/app-release.aab
 │      ./gradlew assembleRelease  (if build_type = "apk")
 │
 ├─ 5. Sign
-│      apksigner sign --ks ... --out app-release-signed.aab ...
-│      (falls back to jarsigner if apksigner not found)
+│      AAB: strip existing META-INF signatures (debug or stale release key) →
+│           jarsigner SHA256withRSA → app-release-signed.aab
+│           (prevents "multiple certificate chains" Play Store error)
+│      APK: apksigner (preferred) or jarsigner fallback
 │
 ├─ 6. Google Play API v3
 │      POST /edits              → create edit
