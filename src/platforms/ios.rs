@@ -61,6 +61,7 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
     let ios_dir = resolve_ios_dir(ios);
     if ios_dir.join("Podfile").exists() {
         progress::step(3, total, "Installing CocoaPods");
+        patch_podfile_for_fmt(&ios_dir)?;
         pod_install(&ios_dir).await?;
         progress::success("Pods installed");
     } else {
@@ -298,6 +299,50 @@ fn read_eas_env_vars(build_profile: &str) -> std::collections::HashMap<String, S
 }
 
 // ─── CocoaPods ────────────────────────────────────────────────────────────────
+
+/// Patches the generated Podfile to compile the `fmt` pod with C++20.
+///
+/// Expo prebuild --clean regenerates the Podfile from scratch on every run, so
+/// any manual edits are lost. This function injects the fix into the existing
+/// post_install block after prebuild, before pod install runs.
+///
+/// Root cause: fmt uses FMT_COMPILE_STRING / consteval which requires C++20,
+/// but Xcode's default C++ standard for pods is C++17. The patch sets
+/// CLANG_CXX_LANGUAGE_STANDARD = c++20 only for the fmt target.
+fn patch_podfile_for_fmt(ios_dir: &Path) -> Result<()> {
+    let podfile_path = ios_dir.join("Podfile");
+    let content = std::fs::read_to_string(&podfile_path)?;
+
+    let marker = "# [shipper] fmt c++20 patch";
+    if content.contains(marker) {
+        return Ok(()); // already patched
+    }
+
+    let patch = format!(
+        r#"
+    {marker}
+    installer.pods_project.targets.each do |target|
+      if target.name == 'fmt'
+        target.build_configurations.each do |config|
+          config.build_settings['CLANG_CXX_LANGUAGE_STANDARD'] = 'c++20'
+        end
+      end
+    end
+"#,
+        marker = marker
+    );
+
+    // Insert the patch at the start of the post_install block body,
+    // right before the react_native_post_install call.
+    let anchor = "react_native_post_install(";
+    if let Some(pos) = content.find(anchor) {
+        let (before, after) = content.split_at(pos);
+        let patched = format!("{}{}{}", before, patch, after);
+        std::fs::write(&podfile_path, patched)?;
+    }
+
+    Ok(())
+}
 
 async fn pod_install(ios_dir: &Path) -> Result<()> {
     let spinner = progress::spinner("pod install --repo-update ...");
