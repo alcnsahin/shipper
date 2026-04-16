@@ -305,6 +305,10 @@ async fn pod_install(ios_dir: &Path) -> Result<()> {
     let output = tokio::process::Command::new("pod")
         .args(["install", "--repo-update"])
         .current_dir(ios_dir)
+        // New Architecture is required by react-native-reanimated v3+.
+        // Explicitly set to 1 so a stale RCT_NEW_ARCH_ENABLED=0 in the shell
+        // environment does not break pod install for release builds.
+        .env("RCT_NEW_ARCH_ENABLED", "1")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
