@@ -302,19 +302,22 @@ fn read_eas_env_vars(build_profile: &str) -> std::collections::HashMap<String, S
 async fn pod_install(ios_dir: &Path) -> Result<()> {
     let spinner = progress::spinner("pod install --repo-update ...");
 
-    let status = tokio::process::Command::new("pod")
+    let output = tokio::process::Command::new("pod")
         .args(["install", "--repo-update"])
         .current_dir(ios_dir)
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .status()
+        .output()
         .await
-        .context("Failed to run 'pod install'")?;
+        .context("Failed to run 'pod install' — is CocoaPods installed? (gem install cocoapods)")?;
 
     spinner.finish_and_clear();
 
-    if !status.success() {
-        anyhow::bail!("pod install failed with exit code {:?}", status.code());
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let details = if !stderr.trim().is_empty() { &stderr } else { &stdout };
+        anyhow::bail!("pod install failed:\n\n{}", details.trim());
     }
 
     Ok(())
