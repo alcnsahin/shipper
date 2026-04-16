@@ -273,6 +273,92 @@ Shipper builds and submits in one step, entirely on your local machine.
 
 ---
 
+## Troubleshooting
+
+### `pod install` fails: Reanimated requires New Architecture
+
+**Error:**
+```
+[!] Invalid `RNReanimated.podspec` file: [Reanimated] Reanimated requires
+the New Architecture to be enabled. If you have `RCT_NEW_ARCH_ENABLED=0`
+set in your environment you should remove it.
+```
+
+**Cause:** `react-native-reanimated` v3+ requires New Architecture. If your
+`app.json` has `"newArchEnabled": false`, Expo prebuild generates a Podfile
+that sets `ENV['RCT_NEW_ARCH_ENABLED'] = '0'`, which triggers this error.
+
+**Fix:** Set `"newArchEnabled": true` in `app.json`:
+
+```json
+{
+  "expo": {
+    "newArchEnabled": true
+  }
+}
+```
+
+This also affects users who upgrade to **Xcode 16+ / macOS Sequoia or later**
+since a fresh prebuild regenerates the Podfile and the flag is re-evaluated.
+
+---
+
+### `xcodebuild archive` fails: `fmt` consteval errors (Xcode 16+)
+
+**Error:**
+```
+error: call to consteval function 'fmt::basic_format_string<...>::basic_format_string
+<FMT_COMPILE_STRING, 0>' is not a constant expression
+** ARCHIVE FAILED **
+```
+
+**Cause:** The `fmt` pod uses C++20 `consteval`, but Xcode defaults pods to
+C++17. This surfaced on **Xcode 16+ (Clang 16+)** which became stricter about
+`consteval` in non-C++20 translation units.
+
+**Fix:** Add a config plugin to your Expo project that patches the generated
+Podfile after every `expo prebuild`:
+
+`plugins/withFmtCpp20.js`:
+```js
+const { withDangerousMod } = require('@expo/config-plugins');
+const fs = require('fs');
+const path = require('path');
+
+module.exports = function withFmtCpp20(config) {
+  return withDangerousMod(config, ['ios', (config) => {
+    const podfilePath = path.join(config.modRequest.platformProjectRoot, 'Podfile');
+    let contents = fs.readFileSync(podfilePath, 'utf-8');
+    const marker = '# [shipper] fmt c++20 fix';
+    if (!contents.includes(marker)) {
+      const patch = `
+    ${marker}
+    installer.pods_project.targets.each do |target|
+      if target.name == 'fmt'
+        target.build_configurations.each do |config|
+          config.build_settings['CLANG_CXX_LANGUAGE_STANDARD'] = 'c++20'
+        end
+      end
+    end\n`;
+      contents = contents.replace('react_native_post_install(', patch + '    react_native_post_install(');
+      fs.writeFileSync(podfilePath, contents);
+    }
+    return config;
+  }]);
+};
+```
+
+`app.json`:
+```json
+{
+  "expo": {
+    "plugins": ["./plugins/withFmtCpp20"]
+  }
+}
+```
+
+---
+
 ## License
 
 Proprietary — All rights reserved.
