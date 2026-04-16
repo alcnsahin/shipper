@@ -808,16 +808,35 @@ async fn archive(
         let stderr = String::from_utf8_lossy(&output.stderr);
         let combined = format!("{}\n{}", stdout, stderr);
 
-        // Collect lines that indicate errors or failures.
+        let is_linker_failure = combined.contains("linker command failed")
+            || combined.contains("Undefined symbols")
+            || combined.contains("library not found");
+
         let errors: Vec<&str> = combined
             .lines()
             .filter(|l| {
                 let t = l.trim();
-                (t.contains("error:") || t.contains("fatal:") || t.starts_with("**"))
-                    && !t.starts_with("//")
-                    && !t.is_empty()
+                if t.is_empty() || t.starts_with("//") {
+                    return false;
+                }
+                // Standard compiler/tool errors
+                if t.contains("error:") || t.contains("fatal:") || t.starts_with("**") {
+                    return true;
+                }
+                // Linker-specific output: ld errors, undefined symbols, missing libraries
+                if is_linker_failure
+                    && (t.starts_with("ld:")
+                        || t.starts_with("Undefined symbols")
+                        || t.starts_with("  \"_")
+                        || t.contains("referenced from:")
+                        || t.contains("library not found")
+                        || t.contains("framework not found"))
+                {
+                    return true;
+                }
+                false
             })
-            .take(20)
+            .take(40)
             .collect();
 
         if !errors.is_empty() {
