@@ -2,16 +2,28 @@ use anyhow::{Context, Result};
 use console::style;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::process::Command;
 
 use crate::config::{AndroidConfig, Config};
+use crate::error::ShipperError;
 use crate::stores::playstore;
+
+/// Timeout for expo prebuild.
+const PREP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Timeout for Gradle builds (bundleRelease / assembleRelease).
+const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 use crate::utils::progress;
 use crate::utils::version::{self, AppVersion};
 
 const TOTAL_STEPS: usize = 6;
 
-pub async fn deploy(config: &Config) -> Result<AppVersion> {
+/// Run the full Android deploy pipeline.
+///
+/// When `pre_bumped` is `Some`, the version bump step is skipped — used by
+/// `deploy all` to avoid a race on `app.json` when both platforms run in
+/// parallel.
+pub async fn deploy(config: &Config, pre_bumped: Option<AppVersion>) -> Result<AppVersion> {
     let android = config.android_config()?;
     let google = config.google_credentials()?;
 
@@ -19,40 +31,50 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
     println!();
 
     // Check for a previously built signed artifact and offer to skip the build
-    if let Some(existing) = find_existing_signed_artifact(android) {
-        if prompt_reuse_artifact(&existing)? {
-            let version = read_current_version(android)?;
-            progress::step(5, TOTAL_STEPS, "Uploading to Play Store");
-            let version_code = playstore::upload_aab(
-                google,
-                &android.package_name,
-                &android.track,
-                &existing,
-            )
-            .await?;
-            progress::success(&format!("Uploaded (versionCode: {})", version_code));
-            // Remove the artifact so it cannot be accidentally reused with the
-            // same versionCode on the next deploy.
-            std::fs::remove_file(&existing).ok();
-            progress::step(6, TOTAL_STEPS, "Complete");
-            progress::success(&format!(
-                "{} v{} ({}) → {} track",
-                android.package_name,
-                version.version_name,
-                version.build_number,
-                android.track
-            ));
-            return Ok(version);
+    if pre_bumped.is_none() {
+        if let Some(existing) = find_existing_signed_artifact(android) {
+            if prompt_reuse_artifact(&existing)? {
+                let version = read_current_version(android)?;
+                progress::step(5, TOTAL_STEPS, "Uploading to Play Store");
+                let version_code = playstore::upload_aab(
+                    google,
+                    &android.package_name,
+                    &android.track,
+                    &existing,
+                    android.rollout_fraction,
+                )
+                .await?;
+                progress::success(&format!("Uploaded (versionCode: {})", version_code));
+                std::fs::remove_file(&existing).ok();
+                progress::step(6, TOTAL_STEPS, "Complete");
+                let rollout_hint = format_rollout_hint(android.rollout_fraction, &android.track);
+                progress::success(&format!(
+                    "{} v{} ({}) → {} track{}",
+                    android.package_name,
+                    version.version_name,
+                    version.build_number,
+                    android.track,
+                    rollout_hint
+                ));
+                return Ok(version);
+            }
         }
     }
 
     // Step 1: Version bump
-    progress::step(1, TOTAL_STEPS, "Bumping version");
-    let app_version = bump_version(config, android)?;
-    progress::success(&format!(
-        "{} ({})",
-        app_version.version_name, app_version.build_number
-    ));
+    let app_version = match pre_bumped {
+        Some(v) => {
+            progress::step(1, TOTAL_STEPS, "Version (pre-bumped)");
+            progress::success(&format!("{} ({})", v.version_name, v.build_number));
+            v
+        }
+        None => {
+            progress::step(1, TOTAL_STEPS, "Bumping version");
+            let v = bump_version(config, android)?;
+            progress::success(&format!("{} ({})", v.version_name, v.build_number));
+            v
+        }
+    };
 
     // Step 2: Expo prebuild (if applicable)
     let eas_env = read_eas_env_vars(&android.build_profile);
@@ -69,13 +91,16 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
         expo_prebuild(&eas_env).await?;
         progress::success("Expo prebuild complete");
     } else {
-        progress::step(2, TOTAL_STEPS, "Expo prebuild — skipped (not an Expo project)");
+        progress::step(
+            2,
+            TOTAL_STEPS,
+            "Expo prebuild — skipped (not an Expo project)",
+        );
     }
 
     // Preflight and keystore after prebuild so android/ directory exists
     preflight_checks(android)?;
     ensure_keystore_setup(android).await?;
-    patch_gradle_properties(android)?;
 
     // Step 3: Build
     let artifact_path = if android.build_type == "apk" {
@@ -102,38 +127,62 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
         &android.package_name,
         &android.track,
         &signed_path,
+        android.rollout_fraction,
     )
     .await?;
     progress::success(&format!("Uploaded (versionCode: {})", version_code));
 
     // Step 6: Done
     progress::step(6, TOTAL_STEPS, "Complete");
+    let rollout_hint = format_rollout_hint(android.rollout_fraction, &android.track);
     progress::success(&format!(
-        "{} v{} ({}) → {} track",
+        "{} v{} ({}) → {} track{}",
         android.package_name,
         app_version.version_name,
         app_version.build_number,
-        android.track
+        android.track,
+        rollout_hint
     ));
 
     Ok(app_version)
 }
 
+/// Human-readable rollout suffix, e.g. " (10% staged rollout)".
+fn format_rollout_hint(fraction: Option<f64>, track: &str) -> String {
+    match fraction {
+        Some(f) if f < 1.0 && track == "production" => {
+            format!(" ({:.0}% staged rollout)", f * 100.0)
+        }
+        _ => String::new(),
+    }
+}
+
 // ─── Expo prebuild ────────────────────────────────────────────────────────────
 
 async fn expo_prebuild(env_vars: &std::collections::HashMap<String, String>) -> Result<()> {
-    let output = tokio::process::Command::new("npx")
-        .args(["expo", "prebuild", "--platform", "android", "--clean"])
-        .envs(env_vars)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
-        .context("Failed to run 'npx expo prebuild'")?;
+    let output = tokio::time::timeout(
+        PREP_TIMEOUT,
+        tokio::process::Command::new("npx")
+            .args(["expo", "prebuild", "--platform", "android", "--clean"])
+            .envs(env_vars)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        ShipperError::BuildFailed("expo prebuild (android): timed out after 10 minutes".into())
+    })?
+    .context("Failed to run 'npx expo prebuild'")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Expo prebuild failed: {}", stderr.trim());
+        return Err(ShipperError::BuildFailed(format!(
+            "expo prebuild (android) exited {}:\n{}",
+            exit_code_str(&output.status),
+            tail_lines(&stderr, 30)
+        ))
+        .into());
     }
     Ok(())
 }
@@ -179,9 +228,14 @@ fn preflight_checks(android: &AndroidConfig) -> Result<()> {
         );
     }
 
-    // Check apksigner (part of Android Build Tools)
-    which::which("apksigner").or_else(|_| which::which("jarsigner"))
-        .context("Neither 'apksigner' nor 'jarsigner' found. Install Android SDK.")?;
+    // Check apksigner (part of Android Build Tools); fall back to jarsigner.
+    if which::which("apksigner").is_err() && which::which("jarsigner").is_err() {
+        return Err(crate::error::ShipperError::ToolNotFound {
+            tool: "apksigner",
+            hint: "install Android SDK Build Tools (or ensure a JDK's jarsigner is on PATH)",
+        }
+        .into());
+    }
 
     spinner.finish_and_clear();
 
@@ -202,7 +256,10 @@ fn ensure_local_properties(project_dir: &Path) -> Result<()> {
 
     // If the file already has sdk.dir, nothing to do.
     if let Ok(content) = std::fs::read_to_string(&props_path) {
-        if content.lines().any(|l| l.trim_start().starts_with("sdk.dir")) {
+        if content
+            .lines()
+            .any(|l| l.trim_start().starts_with("sdk.dir"))
+        {
             return Ok(());
         }
     }
@@ -214,8 +271,8 @@ fn ensure_local_properties(project_dir: &Path) -> Result<()> {
         .or_else(|| {
             dirs::home_dir().and_then(|h| {
                 let candidates = [
-                    h.join("Library/Android/sdk"),   // macOS
-                    h.join("Android/Sdk"),            // Linux
+                    h.join("Library/Android/sdk"), // macOS
+                    h.join("Android/Sdk"),         // Linux
                 ];
                 candidates.into_iter().find(|p| p.exists())
             })
@@ -270,10 +327,7 @@ async fn ensure_keystore_setup(android: &AndroidConfig) -> Result<()> {
         "  {}",
         style("If your app is already published on Play Store, uploading a build signed").dim()
     );
-    println!(
-        "  {}",
-        style("with a new keystore will be REJECTED.").dim()
-    );
+    println!("  {}", style("with a new keystore will be REJECTED.").dim());
     println!();
     print!("  Continue and generate a new keystore? [y/N] ");
     io::stdout().flush()?;
@@ -312,14 +366,25 @@ async fn ensure_keystore_setup(android: &AndroidConfig) -> Result<()> {
         .args([
             "-genkeypair",
             "-v",
-            "-keystore", &ks_path.to_string_lossy(),
-            "-alias", &android.keystore_alias,
-            "-keyalg", "RSA",
-            "-keysize", "2048",
-            "-validity", "10000",
-            "-storepass", &password,
-            "-keypass", &password,
-            "-dname", &format!("CN={}, OU=Android, O=Android, L=Android, ST=Android, C=US", android.package_name),
+            "-keystore",
+            &ks_path.to_string_lossy(),
+            "-alias",
+            &android.keystore_alias,
+            "-keyalg",
+            "RSA",
+            "-keysize",
+            "2048",
+            "-validity",
+            "10000",
+            "-storepass",
+            &password,
+            "-keypass",
+            &password,
+            "-dname",
+            &format!(
+                "CN={}, OU=Android, O=Android, L=Android, ST=Android, C=US",
+                android.package_name
+            ),
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -346,8 +411,16 @@ async fn ensure_keystore_setup(android: &AndroidConfig) -> Result<()> {
         std::fs::set_permissions(&pw_path, std::fs::Permissions::from_mode(0o600))?;
     }
 
-    println!("  {} Keystore generated: {}", style("✓").green().bold(), ks_path.display());
-    println!("  {} Password saved to: {}", style("✓").green().bold(), pw_path.display());
+    println!(
+        "  {} Keystore generated: {}",
+        style("✓").green().bold(),
+        ks_path.display()
+    );
+    println!(
+        "  {} Password saved to: {}",
+        style("✓").green().bold(),
+        pw_path.display()
+    );
     println!(
         "  {} Back up {} now!",
         style("!").yellow().bold(),
@@ -361,12 +434,24 @@ async fn ensure_keystore_setup(android: &AndroidConfig) -> Result<()> {
 // ─── Existing artifact detection ─────────────────────────────────────────────
 
 fn find_existing_signed_artifact(android: &AndroidConfig) -> Option<PathBuf> {
-    let ext = if android.build_type == "apk" { "apk" } else { "aab" };
+    let ext = if android.build_type == "apk" {
+        "apk"
+    } else {
+        "aab"
+    };
     let path = Path::new(&android.project_dir)
         .join("app/build/outputs")
-        .join(if ext == "aab" { "bundle/release" } else { "apk/release" })
+        .join(if ext == "aab" {
+            "bundle/release"
+        } else {
+            "apk/release"
+        })
         .join(format!("app-release-signed.{}", ext));
-    if path.exists() { Some(path) } else { None }
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 fn prompt_reuse_artifact(path: &Path) -> Result<bool> {
@@ -375,7 +460,10 @@ fn prompt_reuse_artifact(path: &Path) -> Result<bool> {
         style("?").cyan().bold(),
         path.display()
     );
-    print!("  {} Skip rebuild and upload this? [Y/n] ", style("→").cyan());
+    print!(
+        "  {} Skip rebuild and upload this? [Y/n] ",
+        style("→").cyan()
+    );
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
@@ -427,14 +515,6 @@ fn bump_version(config: &Config, android: &AndroidConfig) -> Result<AppVersion> 
     }
     version::write_gradle_version(&gradle_path, &v)?;
     Ok(v)
-}
-
-// ─── Patch Gradle files ───────────────────────────────────────────────────────
-// expo prebuild regenerates gradle.properties and gradle-wrapper.properties,
-// so apply compatibility fixes after it runs.
-
-fn patch_gradle_properties(_android: &AndroidConfig) -> Result<()> {
-    Ok(())
 }
 
 // ─── JDK detection ────────────────────────────────────────────────────────────
@@ -502,9 +582,7 @@ fn try_java_home(major: &str) -> Option<String> {
 
 /// Read the major Java version from `$JAVA_HOME/release` (e.g. "21" from JAVA_VERSION="21.0.4").
 fn java_major_version(java_home: &str) -> Option<String> {
-    let release = std::fs::read_to_string(
-        std::path::Path::new(java_home).join("release")
-    ).ok()?;
+    let release = std::fs::read_to_string(std::path::Path::new(java_home).join("release")).ok()?;
     for line in release.lines() {
         if line.starts_with("JAVA_VERSION=") {
             // JAVA_VERSION="21.0.4"  or  JAVA_VERSION=17
@@ -523,7 +601,7 @@ async fn build_aab(android: &AndroidConfig) -> Result<PathBuf> {
 
     let java_home = resolve_java_home()?;
 
-    let spinner = progress::spinner("./gradlew bundleRelease (this can take a few minutes)...");
+    let spinner = progress::timed_spinner("./gradlew bundleRelease");
 
     let mut cmd = Command::new("./gradlew");
     cmd.arg("bundleRelease")
@@ -532,8 +610,11 @@ async fn build_aab(android: &AndroidConfig) -> Result<PathBuf> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    let output = cmd.output()
+    let output = tokio::time::timeout(BUILD_TIMEOUT, cmd.output())
         .await
+        .map_err(|_| {
+            ShipperError::BuildFailed("gradlew bundleRelease: timed out after 30 minutes".into())
+        })?
         .context("Failed to run gradlew bundleRelease")?;
 
     spinner.finish_and_clear();
@@ -541,11 +622,13 @@ async fn build_aab(android: &AndroidConfig) -> Result<PathBuf> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        // Gradle prints the failure summary at the end of stdout; show the last 60 lines
         let combined = format!("{}\n{}", stdout, stderr);
-        let all_lines: Vec<&str> = combined.lines().collect();
-        let tail: Vec<&str> = all_lines.iter().rev().take(60).copied().collect::<Vec<_>>().into_iter().rev().collect();
-        anyhow::bail!("Gradle build failed:\n{}", tail.join("\n"));
+        return Err(ShipperError::BuildFailed(format!(
+            "gradlew bundleRelease exited {}:\n{}",
+            exit_code_str(&output.status),
+            tail_lines(&combined, 60)
+        ))
+        .into());
     }
 
     // Find the generated AAB
@@ -569,23 +652,36 @@ async fn build_apk(android: &AndroidConfig) -> Result<PathBuf> {
 
     let java_home = resolve_java_home()?;
 
-    let spinner = progress::spinner("./gradlew assembleRelease...");
+    let spinner = progress::timed_spinner("./gradlew assembleRelease");
 
-    let output = Command::new("./gradlew")
-        .arg("assembleRelease")
-        .current_dir(project_dir)
-        .env("JAVA_HOME", &java_home)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
-        .context("Failed to run gradlew assembleRelease")?;
+    let output = tokio::time::timeout(
+        BUILD_TIMEOUT,
+        Command::new("./gradlew")
+            .arg("assembleRelease")
+            .current_dir(project_dir)
+            .env("JAVA_HOME", &java_home)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        ShipperError::BuildFailed("gradlew assembleRelease: timed out after 30 minutes".into())
+    })?
+    .context("Failed to run gradlew assembleRelease")?;
 
     spinner.finish_and_clear();
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Gradle build failed:\n{}", stderr.trim());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let combined = format!("{}\n{}", stdout, stderr);
+        return Err(ShipperError::BuildFailed(format!(
+            "gradlew assembleRelease exited {}:\n{}",
+            exit_code_str(&output.status),
+            tail_lines(&combined, 60)
+        ))
+        .into());
     }
 
     let apk_path = project_dir
@@ -607,12 +703,14 @@ async fn build_apk(android: &AndroidConfig) -> Result<PathBuf> {
 
 async fn sign_artifact(android: &AndroidConfig, artifact_path: &Path) -> Result<PathBuf> {
     let ks_path = crate::config::expand_path(&android.keystore_path);
-    let ks_password = crate::config::read_secret(&android.keystore_password_path)?;
-    let key_password = if let Some(kp) = &android.key_password_path {
+    let ks_secret = crate::config::read_secret(&android.keystore_password_path)?;
+    let key_secret = if let Some(kp) = &android.key_password_path {
         crate::config::read_secret(kp)?
     } else {
-        ks_password.clone()
+        ks_secret.clone()
     };
+    let ks_password = ks_secret.expose();
+    let key_password = key_secret.expose();
 
     let ext = artifact_path
         .extension()
@@ -633,8 +731,8 @@ async fn sign_artifact(android: &AndroidConfig, artifact_path: &Path) -> Result<
         // certificate chain signed by the correct release keystore.
         sign_aab_release(
             &ks_path,
-            &ks_password,
-            &key_password,
+            ks_password,
+            key_password,
             &android.keystore_alias,
             artifact_path,
             &signed_path,
@@ -647,8 +745,8 @@ async fn sign_artifact(android: &AndroidConfig, artifact_path: &Path) -> Result<
     if which::which("apksigner").is_ok() {
         sign_with_apksigner(
             &ks_path,
-            &ks_password,
-            &key_password,
+            ks_password,
+            key_password,
             &android.keystore_alias,
             artifact_path,
             &signed_path,
@@ -657,8 +755,8 @@ async fn sign_artifact(android: &AndroidConfig, artifact_path: &Path) -> Result<
     } else {
         sign_with_jarsigner(
             &ks_path,
-            &ks_password,
-            &key_password,
+            ks_password,
+            key_password,
             &android.keystore_alias,
             artifact_path,
             &signed_path,
@@ -701,7 +799,8 @@ async fn sign_aab_release(
 
     let spinner = progress::spinner("Signing AAB with jarsigner...");
 
-    let status = Command::new("jarsigner")
+    // Passwords injected via env vars (not argv) to avoid leaking in `ps`.
+    let output_cmd = Command::new("jarsigner")
         .args([
             "-sigalg",
             "SHA256withRSA",
@@ -709,23 +808,30 @@ async fn sign_aab_release(
             "SHA-256",
             "-keystore",
             &ks_path.to_string_lossy(),
-            "-storepass",
-            ks_password,
-            "-keypass",
-            key_password,
+            "-storepass:env",
+            "SHIPPER_KS_PASS",
+            "-keypass:env",
+            "SHIPPER_KEY_PASS",
             &output.to_string_lossy(),
             alias,
         ])
+        .env("SHIPPER_KS_PASS", ks_password)
+        .env("SHIPPER_KEY_PASS", key_password)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        .status()
+        .output()
         .await
         .context("Failed to run jarsigner")?;
 
     spinner.finish_and_clear();
 
-    if !status.success() {
-        anyhow::bail!("jarsigner failed to sign AAB");
+    if !output_cmd.status.success() {
+        let stderr = String::from_utf8_lossy(&output_cmd.stderr);
+        anyhow::bail!(
+            "jarsigner failed to sign AAB (exit {}):\n{}",
+            exit_code_str(&output_cmd.status),
+            tail_lines(&stderr, 20)
+        );
     }
 
     Ok(())
@@ -741,7 +847,8 @@ async fn sign_with_apksigner(
 ) -> Result<()> {
     let spinner = progress::spinner("Signing with apksigner...");
 
-    let status = Command::new("apksigner")
+    // Passwords injected via env vars (not argv) to avoid leaking in `ps`.
+    let output_cmd = Command::new("apksigner")
         .args([
             "sign",
             "--ks",
@@ -749,23 +856,30 @@ async fn sign_with_apksigner(
             "--ks-key-alias",
             alias,
             "--ks-pass",
-            &format!("pass:{}", ks_password),
+            "env:SHIPPER_KS_PASS",
             "--key-pass",
-            &format!("pass:{}", key_password),
+            "env:SHIPPER_KEY_PASS",
             "--out",
             &output.to_string_lossy(),
             &input.to_string_lossy(),
         ])
+        .env("SHIPPER_KS_PASS", ks_password)
+        .env("SHIPPER_KEY_PASS", key_password)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        .status()
+        .output()
         .await
         .context("Failed to run apksigner")?;
 
     spinner.finish_and_clear();
 
-    if !status.success() {
-        anyhow::bail!("apksigner failed with exit code {:?}", status.code());
+    if !output_cmd.status.success() {
+        let stderr = String::from_utf8_lossy(&output_cmd.stderr);
+        anyhow::bail!(
+            "apksigner failed (exit {}):\n{}",
+            exit_code_str(&output_cmd.status),
+            tail_lines(&stderr, 20)
+        );
     }
 
     Ok(())
@@ -780,12 +894,12 @@ async fn sign_with_jarsigner(
     output: &Path,
 ) -> Result<()> {
     // jarsigner signs in-place, so copy first
-    std::fs::copy(input, output)
-        .context("Failed to copy artifact for signing")?;
+    std::fs::copy(input, output).context("Failed to copy artifact for signing")?;
 
     let spinner = progress::spinner("Signing with jarsigner...");
 
-    let status = Command::new("jarsigner")
+    // Passwords injected via env vars (not argv) to avoid leaking in `ps`.
+    let output_cmd = Command::new("jarsigner")
         .args([
             "-verbose",
             "-sigalg",
@@ -794,24 +908,45 @@ async fn sign_with_jarsigner(
             "SHA-256",
             "-keystore",
             &ks_path.to_string_lossy(),
-            "-storepass",
-            ks_password,
-            "-keypass",
-            key_password,
+            "-storepass:env",
+            "SHIPPER_KS_PASS",
+            "-keypass:env",
+            "SHIPPER_KEY_PASS",
             &output.to_string_lossy(),
             alias,
         ])
+        .env("SHIPPER_KS_PASS", ks_password)
+        .env("SHIPPER_KEY_PASS", key_password)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        .status()
+        .output()
         .await
         .context("Failed to run jarsigner")?;
 
     spinner.finish_and_clear();
 
-    if !status.success() {
-        anyhow::bail!("jarsigner failed with exit code {:?}", status.code());
+    if !output_cmd.status.success() {
+        let stderr = String::from_utf8_lossy(&output_cmd.stderr);
+        anyhow::bail!(
+            "jarsigner failed (exit {}):\n{}",
+            exit_code_str(&output_cmd.status),
+            tail_lines(&stderr, 20)
+        );
     }
 
     Ok(())
+}
+
+/// Return the last `n` lines of `text`.
+fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().rev().take(n).collect();
+    lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+}
+
+/// Format an exit status as a human-readable string.
+fn exit_code_str(status: &std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => code.to_string(),
+        None => "signal".to_string(),
+    }
 }

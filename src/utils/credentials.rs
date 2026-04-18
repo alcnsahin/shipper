@@ -107,7 +107,10 @@ pub fn migrate_stray_credentials(
 // ─── Directory helpers ────────────────────────────────────────────────────────
 
 pub fn project_android_keys_dir(project_name: &str) -> PathBuf {
-    shipper_home().join(project_name).join("android").join("keys")
+    shipper_home()
+        .join(project_name)
+        .join("android")
+        .join("keys")
 }
 
 pub fn project_ios_keys_dir(project_name: &str) -> PathBuf {

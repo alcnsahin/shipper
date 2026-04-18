@@ -2,38 +2,59 @@ use anyhow::{Context, Result};
 use console::style;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::process::Command;
 
 use crate::config::{AppleCredentials, Config, IosConfig};
+use crate::error::ShipperError;
 use crate::stores::appstore;
 use crate::utils::progress;
 use crate::utils::version::{self, AppVersion};
 
-const TOTAL_STEPS_WITH_POLL: usize = 7;
-const TOTAL_STEPS_NO_POLL: usize = 6;
+/// Timeout for expo prebuild / pod install.
+const PREP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Timeout for xcodebuild archive.
+const ARCHIVE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Timeout for xcodebuild -exportArchive.
+const EXPORT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Timeout for xcrun altool upload.
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
-pub async fn deploy(config: &Config) -> Result<AppVersion> {
+const TOTAL_STEPS_BASE: usize = 6;
+
+/// Run the full iOS deploy pipeline.
+///
+/// When `pre_bumped` is `Some`, the version bump step is skipped — used by
+/// `deploy all` to avoid a race on `app.json` when both platforms run in
+/// parallel.
+pub async fn deploy(config: &Config, pre_bumped: Option<AppVersion>) -> Result<AppVersion> {
     let ios = config.ios_config()?;
     let apple = config.apple_credentials()?;
 
     preflight_checks(ios)?;
 
-    let total = if ios.asc_app_id.is_some() {
-        TOTAL_STEPS_WITH_POLL
-    } else {
-        TOTAL_STEPS_NO_POLL
-    };
+    // Step count: 6 base + 1 if polling + 1 if TestFlight groups
+    let has_poll = ios.asc_app_id.is_some();
+    let has_testflight = has_poll && !ios.testflight_groups.is_empty();
+    let total = TOTAL_STEPS_BASE + usize::from(has_poll) + usize::from(has_testflight);
 
     println!("{}", style("iOS Pipeline").bold().underlined());
     println!();
 
     // Step 1: Version bump
-    progress::step(1, total, "Bumping version");
-    let app_version = bump_version(config, ios)?;
-    progress::success(&format!(
-        "{} ({})",
-        app_version.version_name, app_version.build_number
-    ));
+    let app_version = match pre_bumped {
+        Some(v) => {
+            progress::step(1, total, "Version (pre-bumped)");
+            progress::success(&format!("{} ({})", v.version_name, v.build_number));
+            v
+        }
+        None => {
+            progress::step(1, total, "Bumping version");
+            let v = bump_version(config, ios)?;
+            progress::success(&format!("{} ({})", v.version_name, v.build_number));
+            v
+        }
+    };
 
     // Read env vars from eas.json for the configured build profile.
     // These are injected into expo prebuild and xcodebuild so EXPO_PUBLIC_* values
@@ -107,12 +128,20 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
         &apple.team_id,
         &app_version,
         &eas_env,
-    ).await?;
+    )
+    .await?;
     progress::success(&format!("Archive created: {}", archive_path.display()));
 
     // Step 5: Export IPA
     progress::step(5, total, "Exporting IPA");
-    let ipa_path = export_ipa(ios, &archive_path, signing_profile.as_deref(), signing_identity.as_deref(), &apple.team_id).await?;
+    let ipa_path = export_ipa(
+        ios,
+        &archive_path,
+        signing_profile.as_deref(),
+        signing_identity.as_deref(),
+        &apple.team_id,
+    )
+    .await?;
     progress::success(&format!("IPA: {}", ipa_path.display()));
 
     // Step 6: Upload to App Store Connect
@@ -121,16 +150,44 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
     progress::success("Upload complete");
 
     // Step 7: Poll processing (only if asc_app_id is set)
+    let mut current_step = 7;
     if let Some(asc_app_id) = &ios.asc_app_id {
-        progress::step(7, total, "Waiting for App Store Connect processing");
-        let build_id = appstore::poll_build_processing(
+        progress::step(
+            current_step,
+            total,
+            "Waiting for App Store Connect processing",
+        );
+        let processed = appstore::poll_build_processing(
             apple,
             asc_app_id,
-            &app_version.version_name,
             &app_version.build_number.to_string(),
         )
         .await?;
-        progress::success(&format!("Build processed (id: {})", build_id));
+        let uploaded = processed.uploaded_date.as_deref().unwrap_or("unknown");
+        progress::success(&format!(
+            "Build processed — v{} (id: {}, uploaded: {})",
+            processed.version, processed.id, uploaded
+        ));
+        current_step += 1;
+
+        // Step 8: TestFlight distribution (only when groups are configured)
+        if !ios.testflight_groups.is_empty() {
+            progress::step(current_step, total, "Distributing to TestFlight groups");
+
+            // Submit for beta review first
+            appstore::submit_to_testflight(apple, &processed.id).await?;
+            tracing::info!("Build submitted for beta review");
+
+            // Add to each configured group
+            for group in &ios.testflight_groups {
+                appstore::add_build_to_beta_group(apple, asc_app_id, &processed.id, group).await?;
+                println!("    {} Added to group \"{}\"", style("✓").green(), group);
+            }
+            progress::success(&format!(
+                "Distributed to {} group(s)",
+                ios.testflight_groups.len()
+            ));
+        }
     } else {
         println!(
             "  {} Build polling skipped — add asc_app_id to shipper.toml after creating the app in App Store Connect",
@@ -146,8 +203,11 @@ pub async fn deploy(config: &Config) -> Result<AppVersion> {
 fn preflight_checks(ios: &IosConfig) -> Result<()> {
     let spinner = progress::spinner("Running preflight checks...");
 
-    check_tool("xcodebuild")?;
-    check_tool("xcrun")?;
+    check_tool("xcodebuild", "install Xcode from the App Store")?;
+    check_tool(
+        "xcrun",
+        "install the Xcode Command Line Tools (xcode-select --install)",
+    )?;
 
     // Verify workspace/project is configured
     if ios.workspace.is_none() && ios.project.is_none() {
@@ -172,9 +232,8 @@ fn preflight_checks(ios: &IosConfig) -> Result<()> {
     Ok(())
 }
 
-fn check_tool(name: &str) -> Result<()> {
-    which::which(name)
-        .with_context(|| format!("'{}' not found. Install Xcode and try again.", name))?;
+fn check_tool(tool: &'static str, hint: &'static str) -> Result<()> {
+    which::which(tool).map_err(|_| crate::error::ShipperError::ToolNotFound { tool, hint })?;
     Ok(())
 }
 
@@ -260,18 +319,29 @@ fn resolve_ios_dir(ios: &IosConfig) -> PathBuf {
 // ─── Expo prebuild ────────────────────────────────────────────────────────────
 
 async fn expo_prebuild(env_vars: &std::collections::HashMap<String, String>) -> Result<()> {
-    let output = Command::new("npx")
-        .args(["expo", "prebuild", "--platform", "ios", "--clean"])
-        .envs(env_vars)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
-        .context("Failed to run 'npx expo prebuild'")?;
+    let output = tokio::time::timeout(
+        PREP_TIMEOUT,
+        Command::new("npx")
+            .args(["expo", "prebuild", "--platform", "ios", "--clean"])
+            .envs(env_vars)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        ShipperError::BuildFailed("expo prebuild (ios): timed out after 10 minutes".into())
+    })?
+    .context("Failed to run 'npx expo prebuild'")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Expo prebuild failed: {}", stderr.trim());
+        return Err(ShipperError::BuildFailed(format!(
+            "expo prebuild (ios) exited {}:\n{}",
+            exit_code_str(&output.status),
+            tail_lines(&stderr, 30)
+        ))
+        .into());
     }
     Ok(())
 }
@@ -300,24 +370,37 @@ fn read_eas_env_vars(build_profile: &str) -> std::collections::HashMap<String, S
 // ─── CocoaPods ────────────────────────────────────────────────────────────────
 
 async fn pod_install(ios_dir: &Path) -> Result<()> {
-    let spinner = progress::spinner("pod install --repo-update ...");
+    let spinner = progress::timed_spinner("pod install --repo-update");
 
-    let output = tokio::process::Command::new("pod")
-        .args(["install", "--repo-update"])
-        .current_dir(ios_dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
-        .context("Failed to run 'pod install' — is CocoaPods installed? (gem install cocoapods)")?;
+    let output = tokio::time::timeout(
+        PREP_TIMEOUT,
+        tokio::process::Command::new("pod")
+            .args(["install", "--repo-update"])
+            .current_dir(ios_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output(),
+    )
+    .await
+    .map_err(|_| ShipperError::BuildFailed("pod install: timed out after 10 minutes".into()))?
+    .context("Failed to run 'pod install' — is CocoaPods installed? (gem install cocoapods)")?;
 
     spinner.finish_and_clear();
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let details = if !stderr.trim().is_empty() { &stderr } else { &stdout };
-        anyhow::bail!("pod install failed:\n\n{}", details.trim());
+        let details = if !stderr.trim().is_empty() {
+            &stderr
+        } else {
+            &stdout
+        };
+        return Err(ShipperError::BuildFailed(format!(
+            "pod install exited {}:\n{}",
+            exit_code_str(&output.status),
+            tail_lines(details, 40)
+        ))
+        .into());
     }
 
     Ok(())
@@ -412,6 +495,7 @@ fn collect_shared_schemes() -> Vec<String> {
 /// and provisioning profile are already installed. If not, looks for them in:
 ///   1. ~/.shipper/keys/<bundle_id>/
 ///   2. ./credentials/ios/   (EAS download location)
+///
 /// If still missing, runs `eas credentials --platform ios` automatically to
 /// download them, then copies to ~/.shipper/keys/<bundle_id>/ and installs.
 async fn ensure_signing_setup(ios: &IosConfig, project_name: &str) -> Result<()> {
@@ -430,13 +514,20 @@ async fn ensure_signing_setup(ios: &IosConfig, project_name: &str) -> Result<()>
         .join("ios")
         .join("keys");
 
-    let search_dirs: &[PathBuf] = &[
-        shipper_dir.clone(),
-        PathBuf::from("credentials/ios"),
-    ];
+    let search_dirs: &[PathBuf] = &[shipper_dir.clone(), PathBuf::from("credentials/ios")];
 
-    let find_cert = || search_dirs.iter().map(|d| d.join("dist-cert.p12")).find(|p| p.exists());
-    let find_profile = || search_dirs.iter().map(|d| d.join("profile.mobileprovision")).find(|p| p.exists());
+    let find_cert = || {
+        search_dirs
+            .iter()
+            .map(|d| d.join("dist-cert.p12"))
+            .find(|p| p.exists())
+    };
+    let find_profile = || {
+        search_dirs
+            .iter()
+            .map(|d| d.join("profile.mobileprovision"))
+            .find(|p| p.exists())
+    };
 
     // If anything is missing from both Xcode dirs and local disk, fetch via EAS automatically.
     if (!has_cert && find_cert().is_none()) || (!has_profile && find_profile().is_none()) {
@@ -446,12 +537,19 @@ async fn ensure_signing_setup(ios: &IosConfig, project_name: &str) -> Result<()>
     if !has_cert {
         match find_cert() {
             Some(ref path) => {
-                let creds_json = search_dirs.iter().map(|d| d.join("credentials.json")).find(|p| p.exists());
+                let creds_json = search_dirs
+                    .iter()
+                    .map(|d| d.join("credentials.json"))
+                    .find(|p| p.exists());
                 let password = read_p12_password(creds_json.as_deref())?;
-                let spinner = progress::spinner("Installing distribution certificate to Keychain...");
+                let spinner =
+                    progress::spinner("Installing distribution certificate to Keychain...");
                 import_certificate(path, &password)?;
                 spinner.finish_and_clear();
-                println!("  {} Distribution certificate installed", style("✓").green().bold());
+                println!(
+                    "  {} Distribution certificate installed",
+                    style("✓").green().bold()
+                );
                 persist_to_shipper_keys(path, &shipper_dir, "dist-cert.p12")?;
                 if let Some(ref cj) = creds_json {
                     persist_to_shipper_keys(cj, &shipper_dir, "credentials.json")?;
@@ -472,7 +570,10 @@ async fn ensure_signing_setup(ios: &IosConfig, project_name: &str) -> Result<()>
                 let spinner = progress::spinner("Installing provisioning profile...");
                 install_profile(path)?;
                 spinner.finish_and_clear();
-                println!("  {} Provisioning profile installed", style("✓").green().bold());
+                println!(
+                    "  {} Provisioning profile installed",
+                    style("✓").green().bold()
+                );
                 persist_to_shipper_keys(path, &shipper_dir, "profile.mobileprovision")?;
             }
             None => {
@@ -509,13 +610,19 @@ async fn fetch_eas_credentials(_ios: &IosConfig, shipper_dir: &Path) -> Result<(
     println!();
 
     if !status.success() {
-        anyhow::bail!("'eas credentials --platform ios' failed — cannot continue without signing credentials");
+        anyhow::bail!(
+            "'eas credentials --platform ios' failed — cannot continue without signing credentials"
+        );
     }
 
     // Move any files EAS downloaded to ./credentials/ios/ into ~/.shipper/keys/<bundle_id>/
     // and delete them from the project directory — private keys must not stay in source tree.
     let eas_dir = PathBuf::from("credentials/ios");
-    for filename in &["dist-cert.p12", "profile.mobileprovision", "credentials.json"] {
+    for filename in &[
+        "dist-cert.p12",
+        "profile.mobileprovision",
+        "credentials.json",
+    ] {
         let src = eas_dir.join(filename);
         if src.exists() {
             persist_to_shipper_keys(&src, shipper_dir, filename).ok();
@@ -544,7 +651,12 @@ fn read_p12_password(creds_json: Option<&Path>) -> Result<String> {
     if let Some(path) = creds_json {
         if let Ok(content) = std::fs::read_to_string(path) {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                for key in &["certPassword", "password", "p12Password", "distributionCertificatePassword"] {
+                for key in &[
+                    "certPassword",
+                    "password",
+                    "p12Password",
+                    "distributionCertificatePassword",
+                ] {
                     if let Some(pw) = json[key].as_str() {
                         return Ok(pw.to_string());
                     }
@@ -568,10 +680,14 @@ fn import_certificate(p12_path: &Path, password: &str) -> Result<()> {
         .args([
             "import",
             &p12_path.to_string_lossy(),
-            "-k", &login_keychain.to_string_lossy(),
-            "-P", password,
-            "-T", "/usr/bin/codesign",
-            "-T", "/usr/bin/security",
+            "-k",
+            &login_keychain.to_string_lossy(),
+            "-P",
+            password,
+            "-T",
+            "/usr/bin/codesign",
+            "-T",
+            "/usr/bin/security",
             "-A",
         ])
         .status()
@@ -590,7 +706,9 @@ fn install_profile(profile_path: &Path) -> Result<()> {
     let data = std::fs::read(profile_path)?;
     let text = String::from_utf8_lossy(&data);
     let start = text.find("<?xml").context("Invalid mobileprovision file")?;
-    let end = text.find("</plist>").context("Invalid mobileprovision file")?;
+    let end = text
+        .find("</plist>")
+        .context("Invalid mobileprovision file")?;
     let plist = &text[start..end + "</plist>".len()];
 
     let uuid = extract_plist_string(plist, "UUID")
@@ -601,13 +719,17 @@ fn install_profile(profile_path: &Path) -> Result<()> {
         home.join("Library/Developer/Xcode/UserData/Provisioning Profiles"),
         home.join("Library/MobileDevice/Provisioning Profiles"),
     ];
-    let dest_dir = candidates.iter()
+    let dest_dir = candidates
+        .iter()
         .find(|p| p.exists())
         .cloned()
         .unwrap_or_else(|| candidates[0].clone());
 
     std::fs::create_dir_all(&dest_dir)?;
-    std::fs::copy(profile_path, dest_dir.join(format!("{}.mobileprovision", uuid)))?;
+    std::fs::copy(
+        profile_path,
+        dest_dir.join(format!("{}.mobileprovision", uuid)),
+    )?;
     Ok(())
 }
 
@@ -620,7 +742,11 @@ async fn resolve_signing_config(ios: &IosConfig) -> Result<(Option<String>, Opti
             let detected = detect_provisioning_profile(&ios.bundle_id);
             match detected {
                 Some(ref p) => {
-                    println!("  {} Provisioning profile detected: {}", style("i").dim(), p);
+                    println!(
+                        "  {} Provisioning profile detected: {}",
+                        style("i").dim(),
+                        p
+                    );
                     detected
                 }
                 None => prompt_optional_signing("Provisioning profile name")?,
@@ -637,7 +763,9 @@ async fn resolve_signing_config(ios: &IosConfig) -> Result<(Option<String>, Opti
                     println!("  {} Code sign identity detected: {}", style("i").dim(), i);
                     detected
                 }
-                None => prompt_optional_signing("Code sign identity (e.g. 'Apple Distribution: Company (TEAMID)')")?,
+                None => prompt_optional_signing(
+                    "Code sign identity (e.g. 'Apple Distribution: Company (TEAMID)')",
+                )?,
             }
         }
     };
@@ -691,7 +819,10 @@ fn read_mobileprovision(path: &Path) -> Option<ProfileInfo> {
     let name = extract_plist_string(plist, "Name")?;
     let app_id = extract_plist_string(plist, "application-identifier")?;
     // Strip team prefix: "TEAMID.com.example.app" → "com.example.app"
-    let bundle_id = app_id.splitn(2, '.').nth(1).unwrap_or(&app_id).to_string();
+    let bundle_id = app_id
+        .split_once('.')
+        .map(|(_, rest)| rest.to_string())
+        .unwrap_or_else(|| app_id.clone());
     let is_development = plist.contains("<key>get-task-allow</key>")
         && plist
             .split("<key>get-task-allow</key>")
@@ -699,7 +830,11 @@ fn read_mobileprovision(path: &Path) -> Option<ProfileInfo> {
             .map(|s| s.contains("<true/>"))
             .unwrap_or(false);
 
-    Some(ProfileInfo { name, bundle_id, is_development })
+    Some(ProfileInfo {
+        name,
+        bundle_id,
+        is_development,
+    })
 }
 
 fn extract_plist_string(plist: &str, key: &str) -> Option<String> {
@@ -736,9 +871,16 @@ fn prompt_optional_signing(label: &str) -> Result<Option<String>> {
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     let trimmed = input.trim().to_string();
-    Ok(if trimmed.is_empty() { None } else { Some(trimmed) })
+    Ok(if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    })
 }
 
+// Parameter list collapses in Faz 6.2 when ios.rs is split and build options
+// move into a dedicated struct.
+#[allow(clippy::too_many_arguments)]
 async fn archive(
     ios: &IosConfig,
     workspace: Option<&str>,
@@ -749,11 +891,9 @@ async fn archive(
     version: &AppVersion,
     eas_env: &std::collections::HashMap<String, String>,
 ) -> Result<PathBuf> {
-    let archive_path = PathBuf::from(&ios.build_dir)
-        .join(format!("{}.xcarchive", scheme));
+    let archive_path = PathBuf::from(&ios.build_dir).join(format!("{}.xcarchive", scheme));
 
-    std::fs::create_dir_all(&ios.build_dir)
-        .context("Failed to create build directory")?;
+    std::fs::create_dir_all(&ios.build_dir).context("Failed to create build directory")?;
 
     let mut args = vec![
         "archive".to_string(),
@@ -790,16 +930,22 @@ async fn archive(
     args.push(format!("CURRENT_PROJECT_VERSION={}", version.build_number));
     args.push(format!("MARKETING_VERSION={}", version.version_name));
 
-    let spinner = progress::spinner("xcodebuild archive (this can take a few minutes)...");
+    let spinner = progress::timed_spinner("xcodebuild archive");
 
-    let output = Command::new("xcodebuild")
-        .args(&args)
-        .envs(eas_env)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
-        .context("Failed to run xcodebuild archive")?;
+    let output = tokio::time::timeout(
+        ARCHIVE_TIMEOUT,
+        Command::new("xcodebuild")
+            .args(&args)
+            .envs(eas_env)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        ShipperError::BuildFailed("xcodebuild archive: timed out after 30 minutes".into())
+    })?
+    .context("Failed to run xcodebuild archive")?;
 
     spinner.finish_and_clear();
 
@@ -839,14 +985,21 @@ async fn archive(
             .take(40)
             .collect();
 
+        let exit = exit_code_str(&output.status);
         if !errors.is_empty() {
-            anyhow::bail!("xcodebuild archive failed:\n{}", errors.join("\n"));
+            return Err(ShipperError::BuildFailed(format!(
+                "xcodebuild archive exited {exit}:\n{}",
+                errors.join("\n")
+            ))
+            .into());
         }
 
         // Fall back: last 40 lines of combined output (xcodebuild summary is at the end).
-        let last_lines: Vec<&str> = combined.lines().rev().take(40).collect::<Vec<_>>()
-            .into_iter().rev().collect();
-        anyhow::bail!("xcodebuild archive failed:\n{}", last_lines.join("\n"));
+        return Err(ShipperError::BuildFailed(format!(
+            "xcodebuild archive exited {exit}:\n{}",
+            tail_lines(&combined, 40)
+        ))
+        .into());
     }
 
     Ok(archive_path)
@@ -863,34 +1016,45 @@ async fn export_ipa(
 ) -> Result<PathBuf> {
     let export_path = PathBuf::from(&ios.build_dir).join("ipa");
 
-    let export_plist = generate_export_plist(ios, provisioning_profile, code_sign_identity, team_id);
+    let export_plist =
+        generate_export_plist(ios, provisioning_profile, code_sign_identity, team_id);
     let plist_path = PathBuf::from(&ios.build_dir).join("ExportOptions.plist");
-    std::fs::write(&plist_path, &export_plist)
-        .context("Failed to write ExportOptions.plist")?;
+    std::fs::write(&plist_path, &export_plist).context("Failed to write ExportOptions.plist")?;
 
-    let spinner = progress::spinner("Exporting IPA...");
+    let spinner = progress::timed_spinner("Exporting IPA");
 
-    let output = Command::new("xcodebuild")
-        .args([
-            "-exportArchive",
-            "-archivePath",
-            &archive_path.to_string_lossy(),
-            "-exportPath",
-            &export_path.to_string_lossy(),
-            "-exportOptionsPlist",
-            &plist_path.to_string_lossy(),
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
-        .context("Failed to run xcodebuild -exportArchive")?;
+    let output = tokio::time::timeout(
+        EXPORT_TIMEOUT,
+        Command::new("xcodebuild")
+            .args([
+                "-exportArchive",
+                "-archivePath",
+                &archive_path.to_string_lossy(),
+                "-exportPath",
+                &export_path.to_string_lossy(),
+                "-exportOptionsPlist",
+                &plist_path.to_string_lossy(),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        ShipperError::BuildFailed("xcodebuild exportArchive: timed out after 10 minutes".into())
+    })?
+    .context("Failed to run xcodebuild -exportArchive")?;
 
     spinner.finish_and_clear();
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("IPA export failed:\n{}", stderr.trim());
+        return Err(ShipperError::BuildFailed(format!(
+            "xcodebuild exportArchive exited {}:\n{}",
+            exit_code_str(&output.status),
+            tail_lines(&stderr, 30)
+        ))
+        .into());
     }
 
     // Find the .ipa file
@@ -978,69 +1142,61 @@ fn ensure_key_for_altool(apple: &AppleCredentials) -> Result<()> {
     std::fs::create_dir_all(&dest_dir)?;
     let dest = dest_dir.join(format!("AuthKey_{}.p8", apple.key_id));
     if !dest.exists() {
-        std::fs::copy(&src, &dest).context("Failed to copy API key to ~/.appstoreconnect/private_keys/")?;
+        std::fs::copy(&src, &dest)
+            .context("Failed to copy API key to ~/.appstoreconnect/private_keys/")?;
     }
     Ok(())
 }
 
-async fn upload_to_asc(
-    _ios: &IosConfig,
-    apple: &AppleCredentials,
-    ipa_path: &Path,
-) -> Result<()> {
+async fn upload_to_asc(_ios: &IosConfig, apple: &AppleCredentials, ipa_path: &Path) -> Result<()> {
     ensure_key_for_altool(apple)?;
 
-    let spinner = progress::spinner("Uploading IPA via xcrun altool...");
+    let spinner = progress::timed_spinner("Uploading IPA via xcrun altool");
 
-    let output = Command::new("xcrun")
-        .args([
-            "altool",
-            "--upload-app",
-            "--type",
-            "ios",
-            "--file",
-            &ipa_path.to_string_lossy(),
-            "--apiKey",
-            &apple.key_id,
-            "--apiIssuer",
-            &apple.issuer_id,
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
-        .context("Failed to run xcrun altool")?;
+    let output = tokio::time::timeout(
+        UPLOAD_TIMEOUT,
+        Command::new("xcrun")
+            .args([
+                "altool",
+                "--upload-app",
+                "--type",
+                "ios",
+                "--file",
+                &ipa_path.to_string_lossy(),
+                "--apiKey",
+                &apple.key_id,
+                "--apiIssuer",
+                &apple.issuer_id,
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("xcrun altool: timed out after 15 minutes"))?
+    .context("Failed to run xcrun altool")?;
 
     spinner.finish_and_clear();
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        anyhow::bail!(
-            "Upload failed:\n{}\n{}",
-            stderr.trim(),
-            stdout.trim()
-        );
+        anyhow::bail!("Upload failed:\n{}\n{}", stderr.trim(), stdout.trim());
     }
 
     Ok(())
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+/// Return the last `n` non-empty lines of `text`.
+fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().rev().take(n).collect();
+    lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+}
 
-async fn run_command(program: &str, args: &[&str], error_msg: &str) -> Result<()> {
-    let output = Command::new(program)
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
-        .with_context(|| format!("Failed to run '{}'", program))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("{}: {}", error_msg, stderr.trim());
+/// Format an exit status as a human-readable string.
+fn exit_code_str(status: &std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => code.to_string(),
+        None => "signal".to_string(),
     }
-
-    Ok(())
 }

@@ -30,9 +30,15 @@ enum Commands {
     Deploy {
         #[command(subcommand)]
         platform: DeployTarget,
+
+        /// Show what would happen without actually building or uploading
+        #[arg(long, global = true)]
+        dry_run: bool,
     },
     /// Initialize shipper in the current project
     Init,
+    /// Validate shipper.toml and ~/.shipper/config.toml
+    Validate,
 }
 
 #[derive(Subcommand, Clone)]
@@ -41,7 +47,7 @@ pub enum DeployTarget {
     Ios,
     /// Build and submit Android app to Play Store
     Android,
-    /// Deploy iOS and Android sequentially
+    /// Deploy iOS and Android in parallel
     All,
 }
 
@@ -49,16 +55,27 @@ pub enum DeployTarget {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    utils::logger::init(cli.verbose);
+    // Load the global config before the logger so `global.log_level` can
+    // set the default filter. Project config (shipper.toml) is loaded later
+    // inside each subcommand and may legitimately be absent (e.g. `init`).
+    let global = config::load_global_or_default();
+    utils::logger::init(cli.verbose, &global.global.log_level);
 
     print_banner();
 
     match cli.command {
-        Commands::Deploy { platform } => {
-            commands::deploy::run(platform).await?;
+        Commands::Deploy { platform, dry_run } => {
+            if dry_run {
+                commands::deploy::dry_run(platform, global)?;
+            } else {
+                commands::deploy::run(platform, global).await?;
+            }
         }
         Commands::Init => {
             commands::init::run().await?;
+        }
+        Commands::Validate => {
+            commands::validate::run()?;
         }
     }
 

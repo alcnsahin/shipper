@@ -12,18 +12,6 @@ impl AppVersion {
     pub fn bump_build(&mut self) {
         self.build_number += 1;
     }
-
-    pub fn bump_patch(&mut self) {
-        let parts: Vec<u32> = self
-            .version_name
-            .split('.')
-            .filter_map(|p| p.parse().ok())
-            .collect();
-        if parts.len() == 3 {
-            self.version_name = format!("{}.{}.{}", parts[0], parts[1], parts[2] + 1);
-        }
-        self.build_number += 1;
-    }
 }
 
 // ─── Expo (app.json) ──────────────────────────────────────────────────────────
@@ -45,7 +33,10 @@ pub fn read_expo_version(app_json_path: &Path) -> Result<AppVersion> {
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(1);
 
-    Ok(AppVersion { version_name, build_number: ios_build })
+    Ok(AppVersion {
+        version_name,
+        build_number: ios_build,
+    })
 }
 
 /// Reads the Android version code from app.json (expo.android.versionCode).
@@ -66,7 +57,10 @@ pub fn read_expo_version_android(app_json_path: &Path) -> Result<AppVersion> {
         .map(|v| v as u32)
         .unwrap_or(1);
 
-    Ok(AppVersion { version_name, build_number: version_code })
+    Ok(AppVersion {
+        version_name,
+        build_number: version_code,
+    })
 }
 
 pub fn write_expo_version_ios(app_json_path: &Path, version: &AppVersion) -> Result<()> {
@@ -101,11 +95,14 @@ pub fn read_info_plist_version(plist_path: &Path) -> Result<AppVersion> {
 
     let version_name = extract_plist_string(&content, "CFBundleShortVersionString")
         .unwrap_or_else(|| "1.0.0".to_string());
-    let build_str = extract_plist_string(&content, "CFBundleVersion")
-        .unwrap_or_else(|| "1".to_string());
+    let build_str =
+        extract_plist_string(&content, "CFBundleVersion").unwrap_or_else(|| "1".to_string());
     let build_number = build_str.parse::<u32>().unwrap_or(1);
 
-    Ok(AppVersion { version_name, build_number })
+    Ok(AppVersion {
+        version_name,
+        build_number,
+    })
 }
 
 pub fn write_info_plist_version(plist_path: &Path, version: &AppVersion) -> Result<()> {
@@ -168,7 +165,10 @@ pub fn read_gradle_version(gradle_path: &Path) -> Result<AppVersion> {
         .map(|m| m.as_str().to_string())
         .unwrap_or_else(|| "1.0.0".to_string());
 
-    Ok(AppVersion { version_name, build_number })
+    Ok(AppVersion {
+        version_name,
+        build_number,
+    })
 }
 
 pub fn write_gradle_version(gradle_path: &Path, version: &AppVersion) -> Result<()> {
@@ -195,4 +195,119 @@ pub fn is_expo_project() -> bool {
         && std::fs::read_to_string("app.json")
             .map(|s| s.contains("\"expo\""))
             .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bump_build_increments_by_one() {
+        let mut v = AppVersion {
+            version_name: "1.2.3".to_string(),
+            build_number: 41,
+        };
+        v.bump_build();
+        assert_eq!(v.build_number, 42);
+        assert_eq!(v.version_name, "1.2.3");
+    }
+
+    #[test]
+    fn extract_plist_string_basic() {
+        let xml = r#"<key>CFBundleShortVersionString</key><string>1.4.2</string>"#;
+        assert_eq!(
+            extract_plist_string(xml, "CFBundleShortVersionString"),
+            Some("1.4.2".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_plist_string_missing_key_returns_none() {
+        let xml = r#"<key>OtherKey</key><string>x</string>"#;
+        assert!(extract_plist_string(xml, "CFBundleVersion").is_none());
+    }
+
+    #[test]
+    fn replace_plist_string_updates_only_target() {
+        let xml = "\
+<key>CFBundleShortVersionString</key><string>1.0.0</string>
+<key>CFBundleVersion</key><string>10</string>";
+        let out = replace_plist_string(xml, "CFBundleVersion", "11");
+        assert!(out.contains("<string>11</string>"));
+        assert!(out.contains("<string>1.0.0</string>"));
+    }
+
+    #[test]
+    fn gradle_round_trip_preserves_unrelated_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("build.gradle");
+        std::fs::write(
+            &path,
+            "android {\n    defaultConfig {\n        versionCode 42\n        versionName \"1.2.3\"\n        applicationId \"com.example\"\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut v = read_gradle_version(&path).unwrap();
+        assert_eq!(v.build_number, 42);
+        assert_eq!(v.version_name, "1.2.3");
+
+        v.bump_build();
+        v.version_name = "1.2.4".to_string();
+        write_gradle_version(&path, &v).unwrap();
+
+        let reread = read_gradle_version(&path).unwrap();
+        assert_eq!(reread.build_number, 43);
+        assert_eq!(reread.version_name, "1.2.4");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("applicationId \"com.example\""));
+    }
+
+    #[test]
+    fn expo_ios_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.json");
+        std::fs::write(
+            &path,
+            r#"{ "expo": { "name": "demo", "version": "1.0.0", "ios": { "buildNumber": "7" } } }"#,
+        )
+        .unwrap();
+
+        let v = read_expo_version(&path).unwrap();
+        assert_eq!(v.version_name, "1.0.0");
+        assert_eq!(v.build_number, 7);
+
+        let bumped = AppVersion {
+            version_name: "1.0.1".to_string(),
+            build_number: 8,
+        };
+        write_expo_version_ios(&path, &bumped).unwrap();
+
+        let reread = read_expo_version(&path).unwrap();
+        assert_eq!(reread.version_name, "1.0.1");
+        assert_eq!(reread.build_number, 8);
+    }
+
+    #[test]
+    fn expo_android_uses_integer_version_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.json");
+        std::fs::write(
+            &path,
+            r#"{ "expo": { "version": "2.0.0", "android": { "versionCode": 15 } } }"#,
+        )
+        .unwrap();
+
+        let v = read_expo_version_android(&path).unwrap();
+        assert_eq!(v.build_number, 15);
+
+        let bumped = AppVersion {
+            version_name: "2.0.0".to_string(),
+            build_number: 16,
+        };
+        write_expo_version_android(&path, &bumped).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"versionCode\": 16"));
+    }
 }

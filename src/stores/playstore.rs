@@ -6,6 +6,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::config::{expand_path, GoogleCredentials};
+use crate::error::ShipperError;
+use crate::stores::http::{map_status_to_error, map_upload_failure, send_with_retry};
 
 const PLAY_BASE: &str = "https://androidpublisher.googleapis.com/androidpublisher/v3/applications";
 
@@ -60,19 +62,26 @@ async fn get_access_token(creds: &GoogleCredentials) -> Result<String> {
         .timeout(Duration::from_secs(15))
         .build()?;
 
-    let res = client
-        .post(&sa.token_uri)
-        .form(&[
-            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
-            ("assertion", &jwt),
-        ])
-        .send()
-        .await?;
+    let form = [
+        ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+        ("assertion", jwt.as_str()),
+    ];
 
-    if !res.status().is_success() {
-        let body = res.text().await.unwrap_or_default();
-        anyhow::bail!("Failed to get Google access token: {}", body);
-    }
+    let res = send_with_retry(
+        || client.post(&sa.token_uri).form(&form),
+        "Google OAuth token exchange",
+    )
+    .await
+    .map_err(|e| match e.downcast::<ShipperError>() {
+        // Terminal 4xx at the token endpoint is almost always a
+        // credential/scope/clock-skew problem — promote it to AuthError
+        // so the CLI can surface a credential-focused remediation hint.
+        Ok(ShipperError::ApiError { status, message }) if (400..500).contains(&status) => {
+            ShipperError::AuthError(format!("{message} (status {status})")).into()
+        }
+        Ok(other) => other.into(),
+        Err(e) => e,
+    })?;
 
     let token: TokenResponse = res.json().await?;
     Ok(token.access_token)
@@ -99,25 +108,31 @@ struct EditResponse {
 }
 
 async fn create_edit(client: &reqwest::Client, package: &str) -> Result<String> {
+    // Retrying is safe: Play Store auto-expires uncommitted edits, so
+    // the worst case is a handful of orphan edits that never get
+    // committed.
     let url = format!("{}/{}/edits", PLAY_BASE, package);
-    let res = client.post(&url).json(&serde_json::json!({})).send().await?;
-
-    if !res.status().is_success() {
-        let body = res.text().await.unwrap_or_default();
-        anyhow::bail!("Failed to create Play Store edit: {}", body);
-    }
+    let res = send_with_retry(
+        || client.post(&url).json(&serde_json::json!({})),
+        "create Play Store edit",
+    )
+    .await?;
 
     let edit: EditResponse = res.json().await?;
     Ok(edit.id)
 }
 
 async fn commit_edit(client: &reqwest::Client, package: &str, edit_id: &str) -> Result<()> {
+    // NOT retried: committing is the state-changing step. A transient
+    // failure after the server accepted the commit would double-submit
+    // on retry. Caller re-runs the full pipeline if needed.
     let url = format!("{}/{}/edits/{}:commit", PLAY_BASE, package, edit_id);
     let res = client.post(&url).send().await?;
 
     if !res.status().is_success() {
+        let status = res.status().as_u16();
         let body = res.text().await.unwrap_or_default();
-        anyhow::bail!("Failed to commit Play Store edit: {}", body);
+        return Err(map_status_to_error(status, body, "commit Play Store edit").into());
     }
 
     Ok(())
@@ -140,6 +155,9 @@ async fn upload_bundle(
         package, edit_id
     );
 
+    // NOT retried: the AAB body is large and not an idempotent upload
+    // session. First-shot failures surface as `UploadFailed`; operator
+    // re-runs the deploy.
     let res = client
         .post(&url)
         .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
@@ -149,8 +167,9 @@ async fn upload_bundle(
         .await?;
 
     if !res.status().is_success() {
+        let status = res.status().as_u16();
         let body = res.text().await.unwrap_or_default();
-        anyhow::bail!("Bundle upload failed: {}", body);
+        return Err(map_upload_failure(status, body, "upload AAB").into());
     }
 
     #[derive(Deserialize)]
@@ -171,34 +190,56 @@ async fn assign_to_track(
     edit_id: &str,
     track: &str,
     version_code: u32,
+    rollout_fraction: Option<f64>,
 ) -> Result<()> {
-    let url = format!("{}/{}/edits/{}/tracks/{}", PLAY_BASE, package, edit_id, track);
+    let url = format!(
+        "{}/{}/edits/{}/tracks/{}",
+        PLAY_BASE, package, edit_id, track
+    );
+
+    // Staged rollout: when a fraction < 1.0 is given on the production track,
+    // the release status is `inProgress` with a `userFraction` field.
+    // Otherwise (no fraction, fraction == 1.0, or non-production track) the
+    // release goes out as `completed` (100% rollout).
+    let use_staged = matches!(rollout_fraction, Some(f) if f < 1.0) && track == "production";
+
+    let release = if use_staged {
+        serde_json::json!({
+            "status": "inProgress",
+            "userFraction": rollout_fraction.unwrap(),
+            "versionCodes": [version_code]
+        })
+    } else {
+        serde_json::json!({
+            "status": "completed",
+            "versionCodes": [version_code]
+        })
+    };
 
     let body = serde_json::json!({
         "track": track,
-        "releases": [{
-            "status": "completed",
-            "versionCodes": [version_code]
-        }]
+        "releases": [release]
     });
 
-    let res = client.put(&url).json(&body).send().await?;
-
-    if !res.status().is_success() {
-        let body = res.text().await.unwrap_or_default();
-        anyhow::bail!("Failed to assign bundle to track '{}': {}", track, body);
-    }
+    // PUT is idempotent — retrying replaces the track release with the
+    // same payload. `send_with_retry` maps non-2xx to typed errors.
+    send_with_retry(
+        || client.put(&url).json(&body),
+        "assign bundle to Play Store track",
+    )
+    .await?;
 
     Ok(())
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-pub async fn upload_aab(
+pub(crate) async fn upload_aab(
     google_creds: &GoogleCredentials,
     package_name: &str,
     track: &str,
     aab_path: &Path,
+    rollout_fraction: Option<f64>,
 ) -> Result<u32> {
     let token = get_access_token(google_creds).await?;
     let client = play_client(&token);
@@ -209,7 +250,15 @@ pub async fn upload_aab(
     let version_code = upload_bundle(&client, package_name, &edit_id, aab_path).await?;
     tracing::debug!("Uploaded bundle, version code: {}", version_code);
 
-    assign_to_track(&client, package_name, &edit_id, track, version_code).await?;
+    assign_to_track(
+        &client,
+        package_name,
+        &edit_id,
+        track,
+        version_code,
+        rollout_fraction,
+    )
+    .await?;
     tracing::debug!("Assigned to track: {}", track);
 
     commit_edit(&client, package_name, &edit_id).await?;

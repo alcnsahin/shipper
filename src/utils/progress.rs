@@ -15,6 +15,20 @@ pub fn spinner(msg: &str) -> ProgressBar {
     pb
 }
 
+/// Spinner that also shows elapsed time. Use for long-running build steps.
+pub fn timed_spinner(msg: &str) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
+            .template("{spinner:.cyan} {msg} {elapsed:.dim}")
+            .unwrap(),
+    );
+    pb.set_message(msg.to_string());
+    pb.enable_steady_tick(Duration::from_millis(80));
+    pb
+}
+
 pub fn step(n: usize, total: usize, msg: &str) {
     println!(
         "  {} {}",
@@ -25,10 +39,6 @@ pub fn step(n: usize, total: usize, msg: &str) {
 
 pub fn success(msg: &str) {
     println!("  {} {}", style("✓").bold().green(), msg);
-}
-
-pub fn failure(msg: &str) {
-    println!("  {} {}", style("✗").bold().red(), msg);
 }
 
 pub fn info(msg: &str) {

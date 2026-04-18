@@ -1,5 +1,5 @@
+use crate::config::{read_secret, Config};
 use anyhow::Result;
-use crate::config::{Config, read_secret};
 
 pub struct DeployResult {
     pub app_name: String,
@@ -27,10 +27,7 @@ pub async fn notify(config: &Config, result: &DeployResult) -> Result<()> {
     Ok(())
 }
 
-async fn send_telegram(
-    config: crate::config::TelegramConfig,
-    result: &DeployResult,
-) -> Result<()> {
+async fn send_telegram(config: crate::config::TelegramConfig, result: &DeployResult) -> Result<()> {
     let token = read_secret(&config.bot_token_path)?;
 
     let icon = if result.success { "✅" } else { "❌" };
@@ -54,7 +51,7 @@ async fn send_telegram(
         )
     };
 
-    let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", token.expose());
     let client = reqwest::Client::new();
     let res = client
         .post(&url)
@@ -76,7 +73,9 @@ async fn send_telegram(
 
 fn escape_markdown(s: &str) -> String {
     // Telegram MarkdownV2 special chars
-    let special = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'];
+    let special = [
+        '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!',
+    ];
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if special.contains(&c) {

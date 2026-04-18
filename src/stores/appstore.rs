@@ -4,9 +4,18 @@ use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use crate::config::{AppleCredentials, expand_path};
+use crate::config::{expand_path, AppleCredentials};
+use crate::stores::http::{map_status_to_error, send_with_retry};
 
 const ASC_BASE: &str = "https://api.appstoreconnect.apple.com/v1";
+
+/// Successful build processing result with diagnostics.
+#[derive(Debug, Clone)]
+pub(crate) struct ProcessedBuild {
+    pub id: String,
+    pub version: String,
+    pub uploaded_date: Option<String>,
+}
 
 // ─── JWT ─────────────────────────────────────────────────────────────────────
 
@@ -18,7 +27,7 @@ struct AscClaims {
     aud: String,
 }
 
-pub fn generate_jwt(creds: &AppleCredentials) -> Result<String> {
+fn generate_jwt(creds: &AppleCredentials) -> Result<String> {
     let key_path = expand_path(&creds.key_path);
     let pem = std::fs::read(&key_path)
         .with_context(|| format!("Failed to read App Store key: {}", key_path.display()))?;
@@ -34,8 +43,7 @@ pub fn generate_jwt(creds: &AppleCredentials) -> Result<String> {
     let mut header = Header::new(Algorithm::ES256);
     header.kid = Some(creds.key_id.clone());
 
-    let key = EncodingKey::from_ec_pem(&pem)
-        .context("Failed to load EC key from .p8 file")?;
+    let key = EncodingKey::from_ec_pem(&pem).context("Failed to load EC key from .p8 file")?;
 
     encode(&header, &claims, &key).context("Failed to generate JWT")
 }
@@ -75,19 +83,18 @@ struct BuildAttributes {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum ProcessingState {
+enum ProcessingState {
     Processing,
     Valid,
     Invalid(String),
     Unknown(String),
 }
 
-pub async fn poll_build_processing(
+pub(crate) async fn poll_build_processing(
     creds: &AppleCredentials,
     app_id: &str,
-    version: &str,
     build_number: &str,
-) -> Result<String> {
+) -> Result<ProcessedBuild> {
     use crate::utils::progress;
 
     let spinner = progress::spinner("Waiting for App Store Connect to process build...");
@@ -104,13 +111,7 @@ pub async fn poll_build_processing(
             ASC_BASE, app_id, build_number
         );
 
-        let res = client.get(&url).send().await?;
-        if !res.status().is_success() {
-            let status = res.status().as_u16();
-            let body = res.text().await.unwrap_or_default();
-            anyhow::bail!("App Store Connect API error ({}): {}", status, body);
-        }
-
+        let res = send_with_retry(|| client.get(&url), "fetch ASC builds").await?;
         let builds: BuildsResponse = res.json().await?;
 
         if let Some(build) = builds.data.first() {
@@ -123,11 +124,20 @@ pub async fn poll_build_processing(
 
             match state {
                 ProcessingState::Valid => {
+                    let uploaded = build
+                        .attributes
+                        .uploaded_date
+                        .as_deref()
+                        .unwrap_or("unknown");
                     spinner.finish_with_message(format!(
-                        "Build {} processed successfully",
-                        build_number
+                        "Build {} (v{}) processed — uploaded {}",
+                        build_number, build.attributes.version, uploaded,
                     ));
-                    return Ok(build.id.clone());
+                    return Ok(ProcessedBuild {
+                        id: build.id.clone(),
+                        version: build.attributes.version.clone(),
+                        uploaded_date: build.attributes.uploaded_date.clone(),
+                    });
                 }
                 ProcessingState::Invalid(ref id) => {
                     spinner.finish_with_message("Build marked INVALID by App Store Connect");
@@ -138,8 +148,13 @@ pub async fn poll_build_processing(
                     );
                 }
                 ProcessingState::Processing => {
+                    let ver_hint = if build.attributes.version.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" v{}", build.attributes.version)
+                    };
                     spinner.set_message(format!(
-                        "Processing... (attempt {}/{})",
+                        "Processing{ver_hint}... (attempt {}/{})",
                         attempt + 1,
                         max_attempts
                     ));
@@ -165,10 +180,7 @@ pub async fn poll_build_processing(
 
 // ─── TestFlight beta submission ───────────────────────────────────────────────
 
-pub async fn submit_to_testflight(
-    creds: &AppleCredentials,
-    build_id: &str,
-) -> Result<()> {
+pub(crate) async fn submit_to_testflight(creds: &AppleCredentials, build_id: &str) -> Result<()> {
     let jwt = generate_jwt(creds)?;
     let client = asc_client(&jwt);
 
@@ -184,18 +196,86 @@ pub async fn submit_to_testflight(
         }
     });
 
+    // Not idempotent in the general sense, but ASC returns 409 when the
+    // build is already submitted, which we treat as success. No retry —
+    // a transient failure leaves the submission in a known state that
+    // the caller can re-drive manually.
     let res = client.post(&url).json(&body).send().await?;
     let status = res.status();
 
     if status.as_u16() == 409 {
-        // Already submitted — that's fine
+        // Already submitted — that's fine.
         tracing::debug!("Build already submitted to TestFlight");
         return Ok(());
     }
 
     if !status.is_success() {
         let body = res.text().await.unwrap_or_default();
-        anyhow::bail!("TestFlight submission failed ({}): {}", status, body);
+        return Err(map_status_to_error(status.as_u16(), body, "TestFlight submit").into());
+    }
+
+    Ok(())
+}
+
+// ─── TestFlight group assignment ──────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct BetaGroupsResponse {
+    data: Vec<BetaGroupData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BetaGroupData {
+    id: String,
+}
+
+/// Add a processed build to a named TestFlight beta group.
+///
+/// Looks up the group by name via ASC API, then creates a relationship
+/// between the group and the build. If the build is already in the group
+/// ASC returns 409 which is treated as success.
+pub(crate) async fn add_build_to_beta_group(
+    creds: &AppleCredentials,
+    app_id: &str,
+    build_id: &str,
+    group_name: &str,
+) -> Result<()> {
+    let jwt = generate_jwt(creds)?;
+    let client = asc_client(&jwt);
+
+    // 1. Find the beta group by name
+    let url = format!(
+        "{}/betaGroups?filter[app]={}&filter[name]={}",
+        ASC_BASE, app_id, group_name
+    );
+    let res = send_with_retry(|| client.get(&url), "fetch beta groups").await?;
+    let groups: BetaGroupsResponse = res.json().await?;
+
+    let group_id = groups.data.first().map(|g| g.id.clone()).with_context(|| {
+        format!(
+            "TestFlight beta group \"{}\" not found in App Store Connect. \
+                 Create it first at https://appstoreconnect.apple.com",
+            group_name
+        )
+    })?;
+
+    // 2. Add build to the group
+    let add_url = format!("{}/betaGroups/{}/relationships/builds", ASC_BASE, group_id);
+    let body = serde_json::json!({
+        "data": [{ "type": "builds", "id": build_id }]
+    });
+
+    let res = client.post(&add_url).json(&body).send().await?;
+    let status = res.status();
+
+    if status.as_u16() == 409 {
+        tracing::debug!("Build already in group \"{}\" — skipping", group_name);
+        return Ok(());
+    }
+
+    if !status.is_success() {
+        let body = res.text().await.unwrap_or_default();
+        return Err(map_status_to_error(status.as_u16(), body, "add build to beta group").into());
     }
 
     Ok(())

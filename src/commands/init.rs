@@ -58,20 +58,36 @@ pub async fn run() -> Result<()> {
         None
     };
 
-    let content = generate_project_config(&project_name, ios_config.as_ref(), android_config.as_ref());
+    let content =
+        generate_project_config(&project_name, ios_config.as_ref(), android_config.as_ref());
     std::fs::write(&toml_path, &content)?;
     println!();
     println!("  {} Created shipper.toml", style("✓").bold().green());
 
+    ensure_gitignore_guards()?;
+
     ensure_global_config(
-        if configure_ios { &detected.apple_team_id } else { &None },
-        if configure_android { service_account_hint.as_deref() } else { None },
+        if configure_ios {
+            &detected.apple_team_id
+        } else {
+            &None
+        },
+        if configure_android {
+            service_account_hint.as_deref()
+        } else {
+            None
+        },
         configure_ios,
         configure_android,
         &project_name,
     )?;
 
-    print_next_steps(configure_ios, configure_android, service_account_hint.is_none(), &project_name);
+    print_next_steps(
+        configure_ios,
+        configure_android,
+        service_account_hint.is_none(),
+        &project_name,
+    );
     Ok(())
 }
 
@@ -95,7 +111,11 @@ async fn run_add_platform(toml_path: &PathBuf, existing: ExistingConfig) -> Resu
     // Tell the user what's already there and what will be added.
     let already: Vec<&str> = [
         if existing.has_ios { Some("ios") } else { None },
-        if existing.has_android { Some("android") } else { None },
+        if existing.has_android {
+            Some("android")
+        } else {
+            None
+        },
     ]
     .iter()
     .flatten()
@@ -181,6 +201,8 @@ async fn run_add_platform(toml_path: &PathBuf, existing: ExistingConfig) -> Resu
     println!();
     println!("  {} Updated shipper.toml", style("✓").bold().green());
 
+    ensure_gitignore_guards()?;
+
     let service_account_hint = if add_android {
         detected.google_service_account.clone()
     } else {
@@ -188,8 +210,16 @@ async fn run_add_platform(toml_path: &PathBuf, existing: ExistingConfig) -> Resu
     };
 
     ensure_global_config(
-        if add_ios { &detected.apple_team_id } else { &None },
-        if add_android { service_account_hint.as_deref() } else { None },
+        if add_ios {
+            &detected.apple_team_id
+        } else {
+            &None
+        },
+        if add_android {
+            service_account_hint.as_deref()
+        } else {
+            None
+        },
         add_ios,
         add_android,
         &project_name,
@@ -218,9 +248,11 @@ impl ExistingConfig {
         let project_name = Regex::new(r#"^\s*name\s*=\s*"([^"]+)""#)
             .ok()
             .and_then(|re| {
-                content
-                    .lines()
-                    .find_map(|line| re.captures(line).and_then(|c| c.get(1)).map(|m| m.as_str().to_string()))
+                content.lines().find_map(|line| {
+                    re.captures(line)
+                        .and_then(|c| c.get(1))
+                        .map(|m| m.as_str().to_string())
+                })
             });
         ExistingConfig {
             has_ios: content.contains("[ios]"),
@@ -250,7 +282,12 @@ fn prompt_ios_inputs(detected: &ProjectDefaults) -> Result<IosInputs> {
             style("i").dim()
         );
     }
-    Ok(IosInputs { workspace, scheme, bundle_id, asc_app_id })
+    Ok(IosInputs {
+        workspace,
+        scheme,
+        bundle_id,
+        asc_app_id,
+    })
 }
 
 fn prompt_android_inputs(detected: &ProjectDefaults, project_name: &str) -> Result<AndroidInputs> {
@@ -267,13 +304,21 @@ fn prompt_android_inputs(detected: &ProjectDefaults, project_name: &str) -> Resu
             Some(other) => other,
         }),
     )?;
-    let build_type = if build_type_input == "aab" { "bundle".to_string() } else { build_type_input };
+    let build_type = if build_type_input == "aab" {
+        "bundle".to_string()
+    } else {
+        build_type_input
+    };
 
     // Project-scoped paths: ~/.shipper/{project_name}/android/keys/
     let android_keys_base = format!("~/.shipper/{}/android/keys", project_name);
-    let keystore_path = detected.keystore_path.clone()
+    let keystore_path = detected
+        .keystore_path
+        .clone()
         .unwrap_or_else(|| format!("{}/release.keystore", android_keys_base));
-    let keystore_alias = detected.keystore_alias.clone()
+    let keystore_alias = detected
+        .keystore_alias
+        .clone()
         .unwrap_or_else(|| "release".to_string());
     let keystore_password_path = format!("{}/keystore-password", android_keys_base);
 
@@ -306,7 +351,9 @@ fn print_next_steps(
         );
     }
     if configure_android && needs_service_account {
-        println!("     3. Place Google service account at ~/.shipper/keys/play-store-sa.json  (shared)");
+        println!(
+            "     3. Place Google service account at ~/.shipper/keys/play-store-sa.json  (shared)"
+        );
         println!(
             "        Android keystore → ~/.shipper/{}/android/keys/",
             project_name
@@ -329,7 +376,10 @@ struct PlatformChoice {
 }
 
 fn prompt_platforms() -> Result<PlatformChoice> {
-    println!("  {} Platform (ios / android / all):", style("?").bold().cyan());
+    println!(
+        "  {} Platform (ios / android / all):",
+        style("?").bold().cyan()
+    );
     print!("  [all]: ");
     io::stdout().flush()?;
 
@@ -338,13 +388,19 @@ fn prompt_platforms() -> Result<PlatformChoice> {
     let trimmed = input.trim().to_lowercase();
 
     let choice = match trimmed.as_str() {
-        "ios" => PlatformChoice { ios: true, android: false },
-        "android" => PlatformChoice { ios: false, android: true },
-        "" | "all" | "both" => PlatformChoice { ios: true, android: true },
-        other => anyhow::bail!(
-            "Unknown platform '{}'. Use: ios, android, or all",
-            other
-        ),
+        "ios" => PlatformChoice {
+            ios: true,
+            android: false,
+        },
+        "android" => PlatformChoice {
+            ios: false,
+            android: true,
+        },
+        "" | "all" | "both" => PlatformChoice {
+            ios: true,
+            android: true,
+        },
+        other => anyhow::bail!("Unknown platform '{}'. Use: ios, android, or all", other),
     };
 
     Ok(choice)
@@ -476,7 +532,10 @@ fn find_eas_android_build_type(eas: &serde_json::Value) -> Option<String> {
     let profiles = eas["build"].as_object()?;
     let order = ["production", "preview", "release"];
     for name in &order {
-        if let Some(val) = profiles.get(*name).and_then(|p| p["android"]["buildType"].as_str()) {
+        if let Some(val) = profiles
+            .get(*name)
+            .and_then(|p| p["android"]["buildType"].as_str())
+        {
             return Some(if val == "aab" { "bundle" } else { val }.to_string());
         }
     }
@@ -601,7 +660,8 @@ configuration = "Release"
 
 fn generate_android_section(android: &AndroidInputs) -> String {
     // Derive the key_password_path from the same directory as keystore_password_path
-    let key_password_path = android.keystore_password_path
+    let key_password_path = android
+        .keystore_password_path
         .rsplit_once('/')
         .map(|(dir, _)| format!("{}/key-password", dir))
         .unwrap_or_else(|| "~/.shipper/keys/key-password".to_string());
@@ -722,7 +782,9 @@ service_account = "{sa_path}"
 service_account = "{sa_path}"
 "#
             );
-            let mut file = std::fs::OpenOptions::new().append(true).open(&config_path)?;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&config_path)?;
             use std::io::Write as _;
             file.write_all(append.as_bytes())?;
             println!(
@@ -733,4 +795,137 @@ service_account = "{sa_path}"
     }
 
     Ok(())
+}
+
+// ─── .gitignore credential guards ────────────────────────────────────────────
+
+/// Credential patterns that must never reach git history. If a repo-root
+/// `.gitignore` exists, any missing patterns are appended under a clearly
+/// labelled block so the next `git status` surfaces the change for review.
+/// If no `.gitignore` exists the step is skipped silently — the user may
+/// not use git at all.
+const GITIGNORE_CREDENTIAL_PATTERNS: &[&str] = &[
+    "*.keystore",
+    "*.jks",
+    "*.p8",
+    "*.p12",
+    "credentials.json",
+    "google-services.json",
+    "GoogleService-Info.plist",
+    "play-store-sa.json",
+    "*-service-account.json",
+];
+
+const GITIGNORE_GUARD_HEADER: &str = "# shipper: credential guards";
+
+fn ensure_gitignore_guards() -> Result<()> {
+    let path = PathBuf::from(".gitignore");
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let existing = std::fs::read_to_string(&path)?;
+    let Some(block) = build_gitignore_append_block(&existing, GITIGNORE_CREDENTIAL_PATTERNS) else {
+        return Ok(());
+    };
+
+    let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+    use std::io::Write as _;
+    file.write_all(block.text.as_bytes())?;
+
+    println!(
+        "  {} Added {} credential pattern{} to .gitignore",
+        style("✓").bold().green(),
+        block.added,
+        if block.added == 1 { "" } else { "s" }
+    );
+    Ok(())
+}
+
+struct GitignoreAppend {
+    text: String,
+    added: usize,
+}
+
+/// Pure helper: given the existing `.gitignore` content and the patterns we
+/// want present, returns the text to append (already starting with the
+/// separator + guard header) and the count added. Returns `None` if every
+/// pattern is already present as an exact top-level line.
+fn build_gitignore_append_block(
+    existing: &str,
+    patterns: &[&'static str],
+) -> Option<GitignoreAppend> {
+    let present: std::collections::HashSet<&str> = existing
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+
+    let missing: Vec<&'static str> = patterns
+        .iter()
+        .filter(|p| !present.contains(*p as &str))
+        .copied()
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+
+    let mut text = String::new();
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push('\n');
+    text.push_str(GITIGNORE_GUARD_HEADER);
+    text.push('\n');
+    for p in &missing {
+        text.push_str(p);
+        text.push('\n');
+    }
+    Some(GitignoreAppend {
+        text,
+        added: missing.len(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gitignore_append_adds_only_missing_patterns() {
+        let existing = "node_modules/\n*.keystore\n";
+        let block = build_gitignore_append_block(existing, &["*.keystore", "credentials.json"])
+            .expect("should need an append");
+        assert_eq!(block.added, 1);
+        assert!(block.text.contains("credentials.json"));
+        assert!(!block.text.contains("*.keystore"));
+        assert!(block.text.contains(GITIGNORE_GUARD_HEADER));
+    }
+
+    #[test]
+    fn gitignore_append_returns_none_when_all_present() {
+        let existing = "*.keystore\ncredentials.json\n";
+        assert!(
+            build_gitignore_append_block(existing, &["*.keystore", "credentials.json"]).is_none()
+        );
+    }
+
+    #[test]
+    fn gitignore_append_inserts_leading_newline_when_missing() {
+        let existing = "node_modules/"; // no trailing newline
+        let block = build_gitignore_append_block(existing, &["*.keystore"]).unwrap();
+        assert!(
+            block.text.starts_with("\n\n# shipper"),
+            "got: {:?}",
+            block.text
+        );
+    }
+
+    #[test]
+    fn gitignore_append_ignores_comment_only_matches() {
+        // A commented-out pattern must not be considered "present".
+        let existing = "# *.keystore\n";
+        let block = build_gitignore_append_block(existing, &["*.keystore"]).unwrap();
+        assert_eq!(block.added, 1);
+    }
 }
