@@ -138,7 +138,17 @@ async fn commit_edit(client: &reqwest::Client, package: &str, edit_id: &str) -> 
 
     if !res.status().is_success() {
         let status = res.status().as_u16();
-        let body = res.text().await.unwrap_or_default();
+        let mut body = res.text().await.unwrap_or_default();
+        // A brand-new app with no published release is a "draft app" and
+        // rejects any non-draft release. Point operators at the `draft`
+        // option rather than leaving them with a bare API error.
+        if status == 400 && body.contains("draft app") {
+            body.push_str(
+                "\n  hint: this app has no published release yet. Set `draft = true` under \
+                 [android] in shipper.toml to upload as a draft release, then finish the \
+                 first rollout manually in the Play Console.",
+            );
+        }
         return Err(map_status_to_error(status, body, "commit Play Store edit").into());
     }
 
@@ -198,19 +208,28 @@ async fn assign_to_track(
     track: &str,
     version_code: u32,
     rollout_fraction: Option<f64>,
+    draft: bool,
 ) -> Result<()> {
     let url = format!(
         "{}/{}/edits/{}/tracks/{}",
         PLAY_BASE, package, edit_id, track
     );
 
-    // Staged rollout: when a fraction < 1.0 is given on the production track,
-    // the release status is `inProgress` with a `userFraction` field.
-    // Otherwise (no fraction, fraction == 1.0, or non-production track) the
-    // release goes out as `completed` (100% rollout).
+    // Release status precedence:
+    // 1. `draft`     → status `draft`; the bundle is staged but not rolled
+    //    out. Required for a "draft app" (no published release yet), which
+    //    rejects any non-draft release with HTTP 400.
+    // 2. staged      → fraction < 1.0 on production → status `inProgress`
+    //    with `userFraction`.
+    // 3. otherwise   → status `completed` (full 100% rollout).
     let use_staged = matches!(rollout_fraction, Some(f) if f < 1.0) && track == "production";
 
-    let release = if use_staged {
+    let release = if draft {
+        serde_json::json!({
+            "status": "draft",
+            "versionCodes": [version_code]
+        })
+    } else if use_staged {
         serde_json::json!({
             "status": "inProgress",
             "userFraction": rollout_fraction.unwrap(),
@@ -247,6 +266,7 @@ pub(crate) async fn upload_aab(
     track: &str,
     aab_path: &Path,
     rollout_fraction: Option<f64>,
+    draft: bool,
 ) -> Result<u32> {
     let token = get_access_token(google_creds).await?;
     let client = play_client(&token);
@@ -264,6 +284,7 @@ pub(crate) async fn upload_aab(
         track,
         version_code,
         rollout_fraction,
+        draft,
     )
     .await?;
     tracing::debug!("Assigned to track: {}", track);

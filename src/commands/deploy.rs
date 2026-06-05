@@ -84,7 +84,9 @@ pub fn dry_run(target: DeployTarget, global: GlobalConfig) -> Result<()> {
                 );
                 println!("    Build:     {}", android.build_type);
                 println!("    Track:     {}", android.track);
-                if let Some(fraction) = android.rollout_fraction {
+                if android.draft {
+                    println!("    Release:   draft (staged, publish manually in Play Console)");
+                } else if let Some(fraction) = android.rollout_fraction {
                     if android.track == "production" && fraction < 1.0 {
                         println!("    Rollout:   {:.0}% staged", fraction * 100.0);
                     }

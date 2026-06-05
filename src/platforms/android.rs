@@ -42,6 +42,7 @@ pub async fn deploy(config: &Config, pre_bumped: Option<AppVersion>) -> Result<A
                     &android.track,
                     &existing,
                     android.rollout_fraction,
+                    android.draft,
                 )
                 .await?;
                 progress::success(&format!("Uploaded (versionCode: {})", version_code));
@@ -128,6 +129,7 @@ pub async fn deploy(config: &Config, pre_bumped: Option<AppVersion>) -> Result<A
         &android.track,
         &signed_path,
         android.rollout_fraction,
+        android.draft,
     )
     .await?;
     progress::success(&format!("Uploaded (versionCode: {})", version_code));
