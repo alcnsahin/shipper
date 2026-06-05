@@ -53,11 +53,21 @@ jobs:
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest
+    # audit-check posts results as a check run, which needs `checks: write`.
+    # Job-level permissions replace the (read-only) default, so `contents:
+    # read` must be restated for `actions/checkout`.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # RUSTSEC-2025-0119: `number_prefix` (transitive via indicatif) is
+          # unmaintained with no fixed release available. It is a formatting
+          # helper with no known vulnerability — tracked, not blocking CI.
+          ignore: RUSTSEC-2025-0119
 
   deny:
     name: cargo-deny

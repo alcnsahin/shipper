@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- Bumped `rustls-webpki` 0.103.11 → 0.103.13, clearing RUSTSEC-2026-0098,
+  -0099, and -0104 (CRL parsing panic + name-constraint handling flaws in
+  the transitive TLS dependency).
 - Introduced opaque `Secret` wrapper (`src/utils/secret.rs`) that redacts its
   value in `Debug`/`Display` and only reveals raw bytes through an explicit
   `expose()` call at the subprocess/HTTP boundary.
