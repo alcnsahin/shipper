@@ -138,11 +138,14 @@ pub struct AndroidConfig {
     /// `inProgress` with the given `userFraction`. Omit or set to 1.0
     /// for a full (100%) rollout. Ignored on non-production tracks.
     pub rollout_fraction: Option<f64>,
-    /// Create the track release with status `draft` instead of publishing it.
-    /// Required for an app that has never had a release (Play Store rejects
-    /// non-draft releases on a "draft app" with HTTP 400). The bundle is
-    /// uploaded and the release is staged, but you finish the rollout
+    /// Force the track release to status `draft` instead of publishing it.
+    /// The bundle is uploaded and staged, but you finish the rollout
     /// manually in the Play Console. Takes precedence over `rollout_fraction`.
+    ///
+    /// You normally do NOT need this: a brand-new app with no published
+    /// release ("draft app") is detected automatically and the first
+    /// release falls back to `draft` on its own. Set this only when you
+    /// want every deploy to stop at a draft release.
     #[serde(default)]
     pub draft: bool,
 }

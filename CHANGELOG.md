@@ -68,13 +68,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Unused `version` (marketing) parameter on `appstore::poll_build_processing`.
 
 ### Added
-- `[android] draft` config option. When `true`, the track release is
-  created with status `draft` (bundle uploaded but not rolled out),
-  which is required for a brand-new "draft app" that has no published
-  release yet — Play Store rejects non-draft releases on such apps with
-  HTTP 400. Takes precedence over `rollout_fraction`. The commit-time
-  400 ("Only releases with status draft may be created on draft app")
-  now also surfaces a hint pointing at this option.
+- Automatic draft-release fallback for brand-new apps. A "draft app"
+  with no published release rejects any non-draft track release with
+  HTTP 400 ("Only releases with status draft may be created on draft
+  app"). shipper now detects this at commit time and transparently
+  re-commits the same edit as a `draft` release — no config change
+  needed. Once the first rollout is published in the Play Console,
+  subsequent deploys commit as `completed` as usual.
+- `[android] draft` config option to force every release to status
+  `draft` (bundle uploaded but not rolled out). Optional — the
+  fallback above covers the common first-release case. Takes
+  precedence over `rollout_fraction`.
 - `stores/http.rs`: shared retry + error-mapping boundary for store
   API clients. Pure `classify_status` + `map_status_to_error` +
   `map_upload_failure` helpers with unit tests for the success /

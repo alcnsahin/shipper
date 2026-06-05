@@ -8,6 +8,7 @@ use std::time::Duration;
 use crate::config::{expand_path, GoogleCredentials};
 use crate::error::ShipperError;
 use crate::stores::http::{map_status_to_error, map_upload_failure, send_with_retry};
+use crate::utils::progress;
 
 const PLAY_BASE: &str = "https://androidpublisher.googleapis.com/androidpublisher/v3/applications";
 
@@ -138,21 +139,22 @@ async fn commit_edit(client: &reqwest::Client, package: &str, edit_id: &str) -> 
 
     if !res.status().is_success() {
         let status = res.status().as_u16();
-        let mut body = res.text().await.unwrap_or_default();
-        // A brand-new app with no published release is a "draft app" and
-        // rejects any non-draft release. Point operators at the `draft`
-        // option rather than leaving them with a bare API error.
-        if status == 400 && body.contains("draft app") {
-            body.push_str(
-                "\n  hint: this app has no published release yet. Set `draft = true` under \
-                 [android] in shipper.toml to upload as a draft release, then finish the \
-                 first rollout manually in the Play Console.",
-            );
-        }
+        let body = res.text().await.unwrap_or_default();
         return Err(map_status_to_error(status, body, "commit Play Store edit").into());
     }
 
     Ok(())
+}
+
+/// A brand-new app with no published release is a "draft app". The Play
+/// Store rejects any non-draft track release on such an app with HTTP 400
+/// ("Only releases with status draft may be created on draft app"). We
+/// detect that specific case to transparently retry as a draft release.
+fn is_draft_app_error(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<ShipperError>(),
+        Some(ShipperError::ApiError { status: 400, message }) if message.contains("draft app")
+    )
 }
 
 // ─── Bundle upload ────────────────────────────────────────────────────────────
@@ -289,8 +291,73 @@ pub(crate) async fn upload_aab(
     .await?;
     tracing::debug!("Assigned to track: {}", track);
 
-    commit_edit(&client, package_name, &edit_id).await?;
-    tracing::debug!("Committed edit");
+    match commit_edit(&client, package_name, &edit_id).await {
+        Ok(()) => {
+            tracing::debug!("Committed edit");
+        }
+        // Auto-fallback: a brand-new app with no published release rejects
+        // non-draft releases. Rather than make the operator toggle a config
+        // flag for the first release (and remember to remove it afterwards),
+        // transparently re-assign the same edit as a draft release and
+        // commit again. Once the first release is published this branch is
+        // never taken — the normal `completed` commit succeeds. If the
+        // caller already requested `draft`, there is nothing to fall back to.
+        Err(e) if !draft && is_draft_app_error(&e) => {
+            tracing::warn!("App has no published release yet — retrying as a draft release");
+            progress::info(
+                "App has no published release yet — uploading as a draft release. \
+                 Publish the first rollout in the Play Console to go live.",
+            );
+            assign_to_track(
+                &client,
+                package_name,
+                &edit_id,
+                track,
+                version_code,
+                rollout_fraction,
+                true,
+            )
+            .await?;
+            commit_edit(&client, package_name, &edit_id).await?;
+            tracing::debug!("Committed edit (draft fallback)");
+        }
+        Err(e) => return Err(e),
+    }
 
     Ok(version_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_draft_app_commit_error() {
+        let err: anyhow::Error = ShipperError::ApiError {
+            status: 400,
+            message: "Only releases with status draft may be created on draft app.".to_string(),
+        }
+        .into();
+        assert!(is_draft_app_error(&err));
+    }
+
+    #[test]
+    fn ignores_other_400_errors() {
+        let err: anyhow::Error = ShipperError::ApiError {
+            status: 400,
+            message: "Version code 5 has already been used.".to_string(),
+        }
+        .into();
+        assert!(!is_draft_app_error(&err));
+    }
+
+    #[test]
+    fn ignores_non_400_draft_app_text() {
+        let err: anyhow::Error = ShipperError::ApiError {
+            status: 403,
+            message: "draft app".to_string(),
+        }
+        .into();
+        assert!(!is_draft_app_error(&err));
+    }
 }
