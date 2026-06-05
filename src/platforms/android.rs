@@ -581,6 +581,10 @@ fn try_java_home(major: &str) -> Option<String> {
 }
 
 /// Read the major Java version from `$JAVA_HOME/release` (e.g. "21" from JAVA_VERSION="21.0.4").
+///
+/// Only used by the macOS `try_java_home` branch (which verifies the version
+/// returned by `/usr/libexec/java_home`); on other targets it would be dead code.
+#[cfg(target_os = "macos")]
 fn java_major_version(java_home: &str) -> Option<String> {
     let release = std::fs::read_to_string(std::path::Path::new(java_home).join("release")).ok()?;
     for line in release.lines() {
