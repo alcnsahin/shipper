@@ -127,7 +127,14 @@ async fn commit_edit(client: &reqwest::Client, package: &str, edit_id: &str) -> 
     // failure after the server accepted the commit would double-submit
     // on retry. Caller re-runs the full pipeline if needed.
     let url = format!("{}/{}/edits/{}:commit", PLAY_BASE, package, edit_id);
-    let res = client.post(&url).send().await?;
+    // The commit request has no body. reqwest does not emit a
+    // `Content-Length` header for body-less POSTs, but Google's frontend
+    // rejects such requests with `411 Length Required`. Set it explicitly.
+    let res = client
+        .post(&url)
+        .header(reqwest::header::CONTENT_LENGTH, 0)
+        .send()
+        .await?;
 
     if !res.status().is_success() {
         let status = res.status().as_u16();

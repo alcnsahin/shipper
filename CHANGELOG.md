@@ -86,6 +86,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registries, warn on duplicate versions).
 
 ### Fixed
+- Play Store `edits:commit` now sends an explicit `Content-Length: 0`
+  header. The commit request has no body, and reqwest omits
+  `Content-Length` for body-less POSTs, which Google's frontend rejected
+  with `411 Length Required` — failing every Android deploy at the final
+  commit step.
 - `clippy::manual_split_once` in `read_mobileprovision` bundle-id parsing.
 - `clippy::manual_strip` in `config::expand_path`.
 - `clippy::doc_lazy_continuation` in `ensure_signing_setup` docs.
